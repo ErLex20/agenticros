@@ -40,6 +40,7 @@ import {
   executeNavigateToPlace,
 } from "@agenticros/core";
 import { getMissionRegistry } from "./mission-registry.js";
+import { startMotionDebug } from "./motion-debug.js";
 import {
   ROS_MSG_COMPRESSED_IMAGE,
   ROS_MSG_IMAGE,
@@ -124,7 +125,13 @@ export interface McpTool {
   description: string;
   inputSchema: {
     type: "object";
-    properties?: Record<string, { type: string; description?: string; default?: unknown }>;
+    properties?: Record<string, {
+      type: string;
+      description?: string;
+      default?: unknown;
+      minimum?: number;
+      maximum?: number;
+    }>;
     required?: string[];
   };
 }
@@ -197,6 +204,21 @@ export const TOOLS: McpTool[] = [
         robot_id: { type: "string", description: "Optional robot id (from ros2_list_robots) to scope this call. When omitted, the active robot is used." },
       },
       required: ["topic", "type", "message"],
+    },
+  },
+  {
+    name: "ros2_move_for",
+    description:
+      "Move the mobile base with a bounded Twist for a short duration, then always publish an emergency stop. Use this instead of ros2_publish for direct robot motion.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        linear_x: { type: "number", minimum: -0.25, maximum: 0.25, description: "Forward speed in m/s; negative moves backward." },
+        angular_z: { type: "number", minimum: -0.5, maximum: 0.5, description: "Yaw rate in rad/s; positive turns left and negative turns right." },
+        duration_seconds: { type: "number", minimum: 0.1, maximum: 3.0, description: "Motion duration from 0.1 to 3.0 seconds." },
+        robot_id: { type: "string", description: "Optional robot id; omitted selects the active robot." },
+      },
+      required: ["linear_x", "angular_z", "duration_seconds"],
     },
   },
   {
@@ -1256,6 +1278,80 @@ export async function handleToolCall(
       }
       const summary = cmdVelMatch && topic.startsWith("/robot") ? `Published to ${topic} (robot prefix applied).` : `Published to ${topic}.`;
       return { content: [{ type: "text", text: summary + "\n" + JSON.stringify({ success: true, topic, type }) }] };
+    }
+
+    case "ros2_move_for": {
+      const linearX = Number(args["linear_x"]);
+      const angularZ = Number(args["angular_z"]);
+      const durationSeconds = Number(args["duration_seconds"]);
+      if (![linearX, angularZ, durationSeconds].every(Number.isFinite)) {
+        return { content: [{ type: "text", text: "linear_x, angular_z and duration_seconds must be finite numbers." }], isError: true };
+      }
+      if (durationSeconds < 0.1 || durationSeconds > 3.0) {
+        return { content: [{ type: "text", text: "duration_seconds must be between 0.1 and 3.0 seconds." }], isError: true };
+      }
+      const message = {
+        linear: { x: linearX, y: 0, z: 0 },
+        angular: { x: 0, y: 0, z: angularZ },
+      };
+      const safe = checkPublishSafety(config, { message }, robot);
+      if (safe.block) {
+        return { content: [{ type: "text", text: safe.blockReason ?? "Blocked by safety." }], isError: true };
+      }
+      const topic = resolveBinding(robot, "cmd_vel", {
+        cmdVelTopic: config.teleop?.cmdVelTopic,
+      }) ?? "/cmd_vel";
+      const type = "geometry_msgs/msg/Twist";
+      const debug = startMotionDebug(transport, topic);
+      let publishCount = 0;
+      try {
+        if (process.env.AGENTICROS_DEBUG_POSE_TOPIC) await new Promise((r) => setTimeout(r, 1000));
+        debug.phase("command");
+        process.stderr.write(`[MotionDebug] command topic=${topic} body vx=${linearX} vy=0 wz=${angularZ} duration=${durationSeconds}s\n`);
+        const deadline = Date.now() + durationSeconds * 1000;
+        while (Date.now() < deadline) {
+          await transport.publish({ topic, type, msg: message });
+          publishCount++;
+          const remaining = deadline - Date.now();
+          if (remaining > 0) {
+            await new Promise((resolve) => setTimeout(resolve, Math.min(100, remaining)));
+          }
+        }
+      } finally {
+        debug.phase("after_stop");
+        process.stderr.write(`[MotionDebug] publishing stop vx=0 vy=0 wz=0\n`);
+        const zero = {
+          linear: { x: 0, y: 0, z: 0 },
+          angular: { x: 0, y: 0, z: 0 },
+        };
+        for (let i = 0; i < 3; i++) {
+          try {
+            await transport.publish({ topic, type, msg: zero });
+          } catch (error) {
+            process.stderr.write(`[MotionDebug] STOP PUBLISH ERROR: ${String(error)}\n`);
+            // Continue attempting the remaining stop publications.
+          }
+        }
+        emergencyStopRobot(transport, robot, config);
+        try {
+          if (process.env.AGENTICROS_DEBUG_POSE_TOPIC) await new Promise((r) => setTimeout(r, 5000));
+        } finally { debug.close(); }
+      }
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: true,
+            topic,
+            linear_x: linearX,
+            angular_z: angularZ,
+            duration_seconds: durationSeconds,
+            publish_count: publishCount,
+            stop_command_sent: true,
+            physical_stop_verified: false,
+          }),
+        }],
+      };
     }
 
     case "ros2_subscribe_once": {

@@ -1,0 +1,24 @@
+{
+  "name": "@agenticros/nebius",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Nebius Token Factory agent adapter for AgenticROS",
+  "main": "./dist/index.js",
+  "bin": {
+    "agenticros-nebius": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "openai": "^6.0.0",
+    "sharp": "^0.33.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "Apache-2.0"
+}
