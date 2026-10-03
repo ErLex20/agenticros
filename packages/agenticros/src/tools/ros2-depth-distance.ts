@@ -8,7 +8,7 @@ import type { OpenClawPluginApi } from "../plugin-api.js";
 import type { AgenticROSConfig } from "@agenticros/core";
 import { toNamespacedTopic } from "@agenticros/core";
 import { getTransportForRobot } from "../service.js";
-import { getDepthDistance } from "../depth.js";
+import { getDepthDistance, parseDepthRoi } from "../depth.js";
 import { REALSENSE_CAMERA_TOPICS } from "./ros2-camera.js";
 import { ROBOT_ID_SCHEMA, resolveRobotForTool } from "./_robot-helpers.js";
 
@@ -31,6 +31,17 @@ export function registerDepthDistanceTool(api: OpenClawPluginApi, config: Agenti
         }),
       ),
       timeout: Type.Optional(Type.Number({ description: "Timeout in ms (default 5000)" })),
+      roi_x_min: Type.Optional(
+        Type.Number({
+          minimum: 0,
+          maximum: 1,
+          description:
+            "Optional region to sample, normalized left edge (0 = image left), e.g. a detected object's bbox. Set all four roi_* fields; defaults to the central 30% of the image.",
+        }),
+      ),
+      roi_y_min: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Optional region top edge (0 = image top)." })),
+      roi_x_max: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Optional region right edge (1 = image right)." })),
+      roi_y_max: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Optional region bottom edge (1 = image bottom)." })),
       ...ROBOT_ID_SCHEMA,
     }),
 
@@ -45,10 +56,15 @@ export function registerDepthDistanceTool(api: OpenClawPluginApi, config: Agenti
 
       try {
         const transport = await getTransportForRobot(config, robot);
-        const result = await getDepthDistance(transport, topic, timeout);
+        const roiFields = ["roi_x_min", "roi_y_min", "roi_x_max", "roi_y_max"] as const;
+        const roi = roiFields.some((k) => params[k] != null)
+          ? parseDepthRoi({ x_min: params["roi_x_min"], y_min: params["roi_y_min"], x_max: params["roi_x_max"], y_max: params["roi_y_max"] })
+          : undefined;
+        const result = await getDepthDistance(transport, topic, timeout, roi);
+        const region = roi ? "roi" : "center";
         const text = result.valid
-          ? `Distance at center (~12th percentile, nearer surfaces): **${result.distance_m} m** (median in same patch: ${result.median_m} m; range ${result.min_m}–${result.max_m} m; ${result.sample_count} pixels). Topic: ${result.topic}.`
-          : `No valid depth in center region (topic: ${result.topic}, ${result.width}×${result.height}, encoding ${result.encoding}). The scene may be out of range or obscured.`;
+          ? `Distance at ${region} (~12th percentile, nearer surfaces): **${result.distance_m} m** (median in same patch: ${result.median_m} m; range ${result.min_m}–${result.max_m} m; ${result.sample_count} pixels). Topic: ${result.topic}.`
+          : `No valid depth in ${region} region (topic: ${result.topic}, ${result.width}×${result.height}, encoding ${result.encoding}). The scene may be out of range or obscured.`;
         return {
           content: [{ type: "text" as const, text }],
           details: result,

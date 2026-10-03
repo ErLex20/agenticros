@@ -66,6 +66,12 @@ export class LocalTransport implements RosTransport {
 
     try {
       this.rclnodejs = require("rclnodejs");
+      // rclnodejs shuts every ROS context down on SIGINT as soon as it is
+      // required. That runs before the host's own handler can publish a final
+      // zero Twist, so a base that holds its last cmd_vel keeps moving after
+      // Ctrl-C. Shutdown is owned by the host (disconnect() below); without a
+      // host handler Node's default SIGINT exit still applies.
+      this.rclnodejs!.removeSignalHandlers();
 
       // Set domain ID before init if non-default
       if (this.domainId !== 0) {

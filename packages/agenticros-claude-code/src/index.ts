@@ -15,7 +15,7 @@ import type { AgenticROSConfig } from "@agenticros/core";
 import { renderAgenticROSBanner } from "@agenticros/core";
 import { loadConfig, loadConfigAsync } from "./config.js";
 import { connect, disconnect } from "./transport.js";
-import { TOOLS, handleToolCall, MEMORY_TOOL_NAMES, HIVE_TOOL_NAMES, NO_TRANSPORT_TOOL_NAMES } from "./tools.js";
+import { TOOLS, abortTimedMotion, handleToolCall, MEMORY_TOOL_NAMES, HIVE_TOOL_NAMES, NO_TRANSPORT_TOOL_NAMES } from "./tools.js";
 import { ensureMemory } from "./memory.js";
 import { ensureHive } from "./hive.js";
 
@@ -78,8 +78,22 @@ function main(): void {
     };
   });
 
+  // Tools that can leave the base moving. If any ran this session, shutdown
+  // publishes an emergency stop before disconnecting (see shutdown()).
+  const MOTION_TOOL_NAMES = new Set([
+    "ros2_move_for",
+    "ros2_publish",
+    "ros2_action_goal",
+    "ros2_find_object",
+    "ros2_follow_me_start",
+    "ros2_navigate_to_place",
+    "run_mission",
+  ]);
+  let motionUsed = false;
+
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+    if (MOTION_TOOL_NAMES.has(name)) motionUsed = true;
     try {
       // Reload config from disk; resolve skillRefs into skills-cache when needed
       config = await loadConfigAsync();
@@ -113,8 +127,23 @@ function main(): void {
     await server.connect(transport);
   }
 
+  let shuttingDown = false;
   function shutdown(): void {
-    disconnect()
+    if (shuttingDown) return;
+    shuttingDown = true;
+    // A client's Ctrl-C reaches this process too (same process group) and may
+    // arrive while a timed motion is still publishing: stop the base first.
+    // Halt in-flight timed motions first so the estop is the last Twist published.
+    const stop = motionUsed
+      ? abortTimedMotion().then(() =>
+          Promise.race([
+            handleToolCall("ros2_estop", {}, config ?? loadConfig()).catch(() => undefined),
+            new Promise((resolve) => setTimeout(resolve, 1500)),
+          ]),
+        )
+      : Promise.resolve();
+    stop
+      .then(() => disconnect())
       .then(() => process.exit(0))
       .catch(() => process.exit(1));
   }

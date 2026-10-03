@@ -11,6 +11,7 @@ import {
   cameraSnapshotFromPlainMessage,
 } from "@agenticros/ros-camera";
 import { PersonDetector } from "./detector.js";
+import { detectClassTiled } from "./tiled.js";
 import { resolveCocoClassId, COCO_CLASSES } from "./coco-classes.js";
 
 const DEFAULT_COLOR_TOPIC = "/camera/camera/color/image_raw/compressed";
@@ -143,7 +144,9 @@ export async function findObject(
 
       const frame = await snapshotOnce(transport, colorTopic, isCompressed).catch(() => null);
       if (frame) {
-        const det = await detector.detectClass(frame.buffer, classId);
+        // Tiled pass: distant objects are too small for a single 640×640
+        // letterboxed inference on wide camera frames.
+        const det = await detectClassTiled(detector, frame.buffer, classId);
         if (det.detections.length > 0) {
           const best = det.detections.reduce((a, b) => (a.confidence > b.confidence ? a : b));
           result = {

@@ -9,9 +9,11 @@
   },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --test-force-exit \"dist/__tests__/*.test.js\""
   },
   "dependencies": {
+    "@agenticros/object-detection": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "openai": "^6.0.0",
     "sharp": "^0.33.0"

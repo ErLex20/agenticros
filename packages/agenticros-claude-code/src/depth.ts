@@ -46,6 +46,37 @@ function percentileLowerSorted(sortedAsc: number[], p: number): number {
   return sortedAsc[idx]!;
 }
 
+/** Region of interest in normalized image coordinates (0 = left/top, 1 = right/bottom). */
+export interface DepthRoi {
+  x_min: number;
+  y_min: number;
+  x_max: number;
+  y_max: number;
+}
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+/** Validate a normalized ROI; returns undefined when absent, throws when malformed. */
+export function parseDepthRoi(value: unknown): DepthRoi | undefined {
+  if (value == null) return undefined;
+  if (typeof value !== "object") throw new Error("roi must be an object {x_min, y_min, x_max, y_max}");
+  const raw = value as Record<string, unknown>;
+  const field = (key: string): number => {
+    const v = raw[key];
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      throw new Error(`roi needs all four fields as finite numbers in [0, 1]; ${key} is ${String(v)}`);
+    }
+    return clamp01(v);
+  };
+  const roi = { x_min: field("x_min"), y_min: field("y_min"), x_max: field("x_max"), y_max: field("y_max") };
+  if (roi.x_max <= roi.x_min || roi.y_max <= roi.y_min) {
+    throw new Error("roi needs x_max > x_min and y_max > y_min");
+  }
+  return roi;
+}
+
 export function sampleDepthMeters(
   width: number,
   height: number,
@@ -54,6 +85,7 @@ export function sampleDepthMeters(
   data: Uint8Array,
   centerFraction = 0.3,
   isBigEndian = false,
+  roi?: DepthRoi,
 ): number[] {
   const enc = normalizeDepthImageEncoding(encoding);
   const values: number[] = [];
@@ -61,10 +93,10 @@ export function sampleDepthMeters(
   const cy = height / 2;
   const halfW = Math.max(1, Math.floor((width * centerFraction) / 2));
   const halfH = Math.max(1, Math.floor((height * centerFraction) / 2));
-  const x0 = Math.max(0, Math.floor(cx - halfW));
-  const x1 = Math.min(width, Math.floor(cx + halfW));
-  const y0 = Math.max(0, Math.floor(cy - halfH));
-  const y1 = Math.min(height, Math.floor(cy + halfH));
+  const x0 = roi ? Math.floor(roi.x_min * width) : Math.max(0, Math.floor(cx - halfW));
+  const x1 = roi ? Math.max(x0 + 1, Math.ceil(roi.x_max * width)) : Math.min(width, Math.floor(cx + halfW));
+  const y0 = roi ? Math.floor(roi.y_min * height) : Math.max(0, Math.floor(cy - halfH));
+  const y1 = roi ? Math.max(y0 + 1, Math.ceil(roi.y_max * height)) : Math.min(height, Math.floor(cy + halfH));
 
   if (enc === "16UC1") {
     for (let y = y0; y < y1; y++) {
@@ -112,12 +144,14 @@ export interface DepthSampleResult {
   sample_count: number;
   min_m: number;
   max_m: number;
+  roi?: DepthRoi;
 }
 
 export async function getDepthDistance(
   transport: RosTransport,
   topic: string,
   timeoutMs = 5000,
+  roi?: DepthRoi,
 ): Promise<DepthSampleResult> {
   const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
     const sub = transport.subscribe(
@@ -150,7 +184,7 @@ export async function getDepthDistance(
   const data = depthImageDataBytes(result.data);
 
   const values = sanitizeDepthSamplesMeters(
-    sampleDepthMeters(width, height, step, encoding, data, 0.3, isBigEndian),
+    sampleDepthMeters(width, height, step, encoding, data, 0.3, isBigEndian, roi),
   );
   const sorted = values.slice().sort((a, b) => a - b);
   const distance_m = percentileLowerSorted(sorted, DEPTH_REPORT_PERCENTILE);
@@ -169,5 +203,6 @@ export async function getDepthDistance(
     sample_count: sorted.length,
     min_m: Math.round(min_m * 1000) / 1000,
     max_m: Math.round(max_m * 1000) / 1000,
+    ...(roi ? { roi } : {}),
   };
 }

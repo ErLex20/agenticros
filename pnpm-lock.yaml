@@ -127,6 +127,9 @@ importers:
 
   packages/agenticros-nebius:
     dependencies:
+      '@agenticros/object-detection':
+        specifier: workspace:*
+        version: link:../object-detection
       '@modelcontextprotocol/sdk':
         specifier: ^1.0.0
         version: 1.27.1(zod@3.25.76)

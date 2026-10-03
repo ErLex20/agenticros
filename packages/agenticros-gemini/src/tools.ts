@@ -51,7 +51,7 @@ import type { FunctionDeclaration, FunctionResponsePart } from "@google/genai";
 import { createFunctionResponsePartFromBase64 } from "@google/genai";
 import { getTransportForRobot } from "./transport.js";
 import { checkPublishSafety } from "./safety.js";
-import { getDepthDistance } from "./depth.js";
+import { getDepthDistance, parseDepthRoi } from "./depth.js";
 import { ensureMemory } from "./memory.js";
 import { ensureHive, getHive, persistHivePatch, setHive } from "./hive.js";
 import {
@@ -287,10 +287,14 @@ export const GEMINI_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
   },
   {
     name: "ros2_depth_distance",
-    description: "Get distance in meters from the robot's depth camera. Samples the center of the depth image. Use when the user asks how far they are from the robot. Pass robot_id to sample a specific robot's depth camera.",
+    description: "Get distance in meters from the robot's depth camera. Samples the center of the depth image, or the optional normalized roi (e.g. the bounding box of a detected object, assuming the depth image is aligned with the color camera). Use when the user asks how far they are from the robot. Pass robot_id to sample a specific robot's depth camera.",
     parametersJsonSchema: schemaFromProps({
       topic: { type: "string", description: `Depth image topic (default: ${DEFAULT_DEPTH_TOPIC})` },
       timeout: { type: "number", description: "Timeout in ms (default 5000)" },
+      roi_x_min: { type: "number", description: "Optional region to sample, normalized left edge (0 = image left). Set all four roi_* fields; defaults to the central 30% of the image." },
+      roi_y_min: { type: "number", description: "Optional region top edge (0 = image top)." },
+      roi_x_max: { type: "number", description: "Optional region right edge (1 = image right)." },
+      roi_y_max: { type: "number", description: "Optional region bottom edge (1 = image bottom)." },
       ...ROBOT_ID_PROP,
     }),
   },
@@ -1171,10 +1175,15 @@ export async function executeTool(
       const topic = resolveCameraSubscribeTopic(robot.namespace, rawTopic);
       const timeout = (args["timeout"] as number | undefined) ?? 5000;
       try {
-        const result = await getDepthDistance(transport, topic, timeout);
+        const roiFields = ["roi_x_min", "roi_y_min", "roi_x_max", "roi_y_max"] as const;
+        const roi = roiFields.some((k) => args[k] != null)
+          ? parseDepthRoi({ x_min: args["roi_x_min"], y_min: args["roi_y_min"], x_max: args["roi_x_max"], y_max: args["roi_y_max"] })
+          : undefined;
+        const result = await getDepthDistance(transport, topic, timeout, roi);
+        const region = roi ? "roi" : "center";
         const text = result.valid
-          ? `Distance at center (~12th percentile, nearer surfaces): **${result.distance_m} m** (median: ${result.median_m} m; range ${result.min_m}–${result.max_m} m; ${result.sample_count} pixels). Topic: ${result.topic}.`
-          : `No valid depth in center region (topic: ${result.topic}, ${result.width}×${result.height}, encoding ${result.encoding}).`;
+          ? `Distance at ${region} (~12th percentile, nearer surfaces): **${result.distance_m} m** (median: ${result.median_m} m; range ${result.min_m}–${result.max_m} m; ${result.sample_count} pixels). Topic: ${result.topic}.`
+          : `No valid depth in ${region} region (topic: ${result.topic}, ${result.width}×${result.height}, encoding ${result.encoding}).`;
         return { output: text };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

@@ -51,7 +51,7 @@ import {
 import { resolveMemoryNamespace } from "@agenticros/core";
 import { getTransportForRobot } from "./transport.js";
 import { checkPublishSafety } from "./safety.js";
-import { getDepthDistance } from "./depth.js";
+import { getDepthDistance, parseDepthRoi } from "./depth.js";
 import { getFollowMeLocal, stopFollowMeLocalIfPresent } from "./follow-me/loop.js";
 import { getFollowMeDepth, stopFollowMeDepthIfPresent } from "./follow-me/depth-loop.js";
 import { findObject } from "@agenticros/object-detection";
@@ -310,11 +310,15 @@ export const TOOLS: McpTool[] = [
   {
     name: "ros2_depth_distance",
     description:
-      "Get distance in meters from the robot's depth camera. Samples the center of the depth image. Use when the user asks how far they are from the robot. Pass robot_id to sample a specific robot's depth camera.",
+      "Get distance in meters from the robot's depth camera. Samples the center of the depth image, or the optional normalized roi (e.g. the bounding box of a detected object, assuming the depth image is aligned with the color camera). Use when the user asks how far they are from the robot. Pass robot_id to sample a specific robot's depth camera.",
     inputSchema: {
       type: "object",
       properties: {
         topic: { type: "string", description: `Depth image topic (default: ${DEFAULT_DEPTH_TOPIC})` },
+        roi_x_min: { type: "number", minimum: 0, maximum: 1, description: "Optional region to sample, normalized left edge (0 = image left). Set all four roi_* fields; defaults to the central 30% of the image." },
+        roi_y_min: { type: "number", minimum: 0, maximum: 1, description: "Optional region top edge (0 = image top)." },
+        roi_x_max: { type: "number", minimum: 0, maximum: 1, description: "Optional region right edge (1 = image right)." },
+        roi_y_max: { type: "number", minimum: 0, maximum: 1, description: "Optional region bottom edge (1 = image bottom)." },
         timeout: { type: "number", description: "Timeout in ms (default 5000)" },
         robot_id: { type: "string", description: "Optional robot id (from ros2_list_robots) to scope this call. When omitted, the active robot is used." },
       },
@@ -661,6 +665,23 @@ export const TOOLS: McpTool[] = [
     },
   },
 ];
+
+/**
+ * Timed motions (ros2_move_for) in progress. On server shutdown they must stop
+ * publishing *before* the final zero Twist, otherwise a base that holds the
+ * last cmd_vel keeps moving after the process exits.
+ */
+let timedMotionAborted = false;
+const activeTimedMotions = new Set<Promise<void>>();
+
+/** Stop every in-flight ros2_move_for and wait (bounded) for its stop publishes. */
+export async function abortTimedMotion(timeoutMs = 1500): Promise<void> {
+  timedMotionAborted = true;
+  await Promise.race([
+    Promise.allSettled([...activeTimedMotions]),
+    new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
+}
 
 export type ToolContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
@@ -1302,6 +1323,12 @@ export async function handleToolCall(
         cmdVelTopic: config.teleop?.cmdVelTopic,
       }) ?? "/cmd_vel";
       const type = "geometry_msgs/msg/Twist";
+      if (timedMotionAborted) {
+        return { content: [{ type: "text", text: "Motion refused: the AgenticROS server is shutting down." }], isError: true };
+      }
+      let finishTracking!: () => void;
+      const tracked = new Promise<void>((resolve) => { finishTracking = resolve; });
+      activeTimedMotions.add(tracked);
       const debug = startMotionDebug(transport, topic);
       let publishCount = 0;
       try {
@@ -1309,7 +1336,7 @@ export async function handleToolCall(
         debug.phase("command");
         process.stderr.write(`[MotionDebug] command topic=${topic} body vx=${linearX} vy=0 wz=${angularZ} duration=${durationSeconds}s\n`);
         const deadline = Date.now() + durationSeconds * 1000;
-        while (Date.now() < deadline) {
+        while (Date.now() < deadline && !timedMotionAborted) {
           await transport.publish({ topic, type, msg: message });
           publishCount++;
           const remaining = deadline - Date.now();
@@ -1333,8 +1360,10 @@ export async function handleToolCall(
           }
         }
         emergencyStopRobot(transport, robot, config);
+        activeTimedMotions.delete(tracked);
+        finishTracking();
         try {
-          if (process.env.AGENTICROS_DEBUG_POSE_TOPIC) await new Promise((r) => setTimeout(r, 5000));
+          if (process.env.AGENTICROS_DEBUG_POSE_TOPIC && !timedMotionAborted) await new Promise((r) => setTimeout(r, 5000));
         } finally { debug.close(); }
       }
       return {
@@ -1536,10 +1565,15 @@ export async function handleToolCall(
       const topic = resolveCameraSubscribeTopic(robot.namespace, rawTopic);
       const timeout = (args["timeout"] as number | undefined) ?? 5000;
       try {
-        const result = await getDepthDistance(transport, topic, timeout);
+        const roiFields = ["roi_x_min", "roi_y_min", "roi_x_max", "roi_y_max"] as const;
+        const roi = roiFields.some((k) => args[k] != null)
+          ? parseDepthRoi({ x_min: args["roi_x_min"], y_min: args["roi_y_min"], x_max: args["roi_x_max"], y_max: args["roi_y_max"] })
+          : undefined;
+        const result = await getDepthDistance(transport, topic, timeout, roi);
+        const region = roi ? "roi" : "center";
         const text = result.valid
-          ? `Distance at center (~12th percentile, nearer surfaces): **${result.distance_m} m** (median: ${result.median_m} m; range ${result.min_m}–${result.max_m} m; ${result.sample_count} pixels). Topic: ${result.topic}.`
-          : `No valid depth in center region (topic: ${result.topic}, ${result.width}×${result.height}, encoding ${result.encoding}).`;
+          ? `Distance at ${region} (~12th percentile, nearer surfaces): **${result.distance_m} m** (median: ${result.median_m} m; range ${result.min_m}–${result.max_m} m; ${result.sample_count} pixels). Topic: ${result.topic}.\n${JSON.stringify(result)}`
+          : `No valid depth in ${region} region (topic: ${result.topic}, ${result.width}×${result.height}, encoding ${result.encoding}).\n${JSON.stringify(result)}`;
         return { content: [{ type: "text", text }] };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

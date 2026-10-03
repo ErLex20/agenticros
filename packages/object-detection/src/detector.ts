@@ -295,11 +295,17 @@ export class PersonDetector {
       const y = (cy - h / 2 - padY) / scale;
       const ww = w / scale;
       const hh = h / scale;
+      // Clip both edges to the image: clamping only the origin would push the far edge outward.
+      const x0 = Math.max(0, x);
+      const y0 = Math.max(0, y);
+      const x1 = Math.min(origW, x + ww);
+      const y1 = Math.min(origH, y + hh);
+      if (x1 <= x0 || y1 <= y0) continue;
       raw.push({
-        x: Math.max(0, x),
-        y: Math.max(0, y),
-        width: Math.min(origW - x, ww),
-        height: Math.min(origH - y, hh),
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
         cx: (cx - padX) / scale,
         cy: (cy - padY) / scale,
         confidence: score,

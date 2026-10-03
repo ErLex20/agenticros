@@ -11,4 +11,10 @@ export {
   type FindObjectResult,
 } from "./find-object.js";
 
+export {
+  detectClassTiled,
+  type TiledDetectionOptions,
+  type TiledDetectionResult,
+} from "./tiled.js";
+
 export { COCO_CLASSES, resolveCocoClassId } from "./coco-classes.js";
