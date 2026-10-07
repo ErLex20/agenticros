@@ -26,6 +26,20 @@ export interface LocalTransportOptions {
 
 /** Internal ROS2 topics/services to filter from introspection results. */
 const INTERNAL_TOPIC_PREFIXES = ["/rosout", "/parameter_events", "/agenticros/"];
+
+/** Long enough for a Nav2 trip across a house at the Go2's walking speed. */
+const DEFAULT_ACTION_TIMEOUT_MS = 600_000;
+
+/** action_msgs/msg/GoalStatus codes. */
+const GOAL_STATUS_NAMES: Record<number, string> = {
+  0: "unknown",
+  1: "accepted",
+  2: "executing",
+  3: "canceling",
+  4: "succeeded",
+  5: "canceled",
+  6: "aborted",
+};
 const INTERNAL_SERVICE_SUFFIXES = [
   "/describe_parameters",
   "/get_parameter_types",
@@ -222,9 +236,11 @@ export class LocalTransport implements RosTransport {
     this.ensureConnected();
 
     const ActionClass = loadMessageClass(options.actionType);
+    // rclnodejs resolves the action type from its "pkg/action/Name" string;
+    // passing the generated class fails with "The message required does not exist".
     const actionClient = new (this.rclnodejs!.ActionClient as any)(
       this.node,
-      ActionClass,
+      options.actionType,
       options.action,
     );
 
@@ -243,38 +259,41 @@ export class LocalTransport implements RosTransport {
       }
     }
 
+    const timeoutMs = options.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let goalHandle: any;
     try {
-      const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          this.activeGoals.delete(options.action);
-          reject(new Error(`Action ${options.action} timed out after 120 seconds`));
-        }, 120_000);
-
-        actionClient.sendGoal(
-          goal,
-          (goalHandle: any) => {
-            // Goal response callback — store for cancellation
-            this.activeGoals.set(options.action, goalHandle);
-          },
-          (feedback: any) => {
-            // Feedback callback
-            if (options.onFeedback) {
-              options.onFeedback(fromRosMessage(feedback));
-            }
-          },
-          (resultResponse: any) => {
-            // Result callback
-            clearTimeout(timer);
-            this.activeGoals.delete(options.action);
-            resolve(fromRosMessage(resultResponse));
-          },
-        );
+      // rclnodejs: sendGoal resolves with the goal handle once the server
+      // answers; getResult() resolves with the result and sets handle.status.
+      goalHandle = await actionClient.sendGoal(goal, (feedback: any) => {
+        options.onFeedback?.(fromRosMessage(feedback));
       });
-
-      return { result: true, values: result };
+      if (!goalHandle.isAccepted()) {
+        return { result: false, values: { status: "rejected" } };
+      }
+      this.activeGoals.set(options.action, goalHandle);
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          void Promise.resolve(goalHandle.cancelGoal()).catch(() => {});
+          reject(new Error(`Action ${options.action} timed out after ${Math.round(timeoutMs / 1000)} seconds (goal canceled)`));
+        }, timeoutMs);
+      });
+      const result = await Promise.race([goalHandle.getResult(), timeout]);
+      const status = GOAL_STATUS_NAMES[goalHandle.status as number] ?? `status_${String(goalHandle.status)}`;
+      return {
+        result: status === "succeeded",
+        values: { status, ...fromRosMessage(result ?? {}) },
+      };
     } finally {
+      if (timer) clearTimeout(timer);
+      if (this.activeGoals.get(options.action) === goalHandle) this.activeGoals.delete(options.action);
       actionClient.destroy();
     }
+  }
+
+  /** Cancel every goal this transport is waiting on (e.g. on emergency stop). */
+  async cancelAllActionGoals(): Promise<void> {
+    await Promise.all([...this.activeGoals.keys()].map((action) => this.cancelActionGoal(action).catch(() => {})));
   }
 
   async cancelActionGoal(action: string): Promise<void> {

@@ -229,6 +229,7 @@ export {
   savePlaceFromArgs,
   findNavigateToCapability,
   executeNavigateToPlace,
+  cancelNavigation,
 } from "./places-runtime.js";
 
 export {

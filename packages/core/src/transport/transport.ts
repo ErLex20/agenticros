@@ -64,6 +64,9 @@ export interface RosTransport {
   /** Cancel an in-progress action goal. */
   cancelActionGoal(action: string): Promise<void>;
 
+  /** Cancel every in-progress goal sent through this transport (emergency stop). */
+  cancelAllActionGoals?(): Promise<void>;
+
   // --- Introspection ---
 
   /** List all available ROS2 topics. */

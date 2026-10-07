@@ -58,9 +58,12 @@ export interface ActionGoalOptions {
   actionType: string;
   args?: Record<string, unknown>;
   onFeedback?: (feedback: Record<string, unknown>) => void;
+  /** Give up (and cancel the goal) after this long. Transport default when unset. */
+  timeoutMs?: number;
 }
 
 export interface ActionResult {
+  /** True only when the goal succeeded (not rejected, aborted or canceled). */
   result: boolean;
   values?: Record<string, unknown>;
 }

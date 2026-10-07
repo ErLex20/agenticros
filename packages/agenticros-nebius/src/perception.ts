@@ -3,7 +3,8 @@
  *
  * COCO targets use the local YOLOv8n detector of @agenticros/object-detection
  * with a tiled pass (precise bearing and bbox, ~1 s on CPU). Other targets,
- * and attribute checks such as colour, use the Nebius vision model on a frame
+ * COCO targets that YOLO misses (common for rendered simulation assets), and
+ * attribute checks such as colour use the Nebius vision model on a frame
  * overlaid with numbered columns, which it localizes far more reliably than
  * free-form pixel boxes.
  */
@@ -16,6 +17,8 @@ import { bearingFromImageX, round, type BBoxNorm, type TargetObservation } from 
 const GRID_COLUMNS = 9;
 /** Detections checked against the target's attributes per frame, highest confidence first. */
 const MAX_CANDIDATES = 3;
+/** More doorway columns than this in one frame are treated as noise. */
+const MAX_DOORWAYS_PER_FRAME = 3;
 const VLM_MAX_WIDTH = 768;
 const VLM_MAX_HEIGHT = 432;
 const SIZE_TO_HEIGHT_FRAC: Record<string, number> = {
@@ -37,11 +40,15 @@ export interface PerceptionOptions {
   visionModel: string;
   hfovDeg: number;
   minConfidence: number;
+  /** YOLO detections below this confidence are checked by the vision model on a crop. */
+  verifyBelowConfidence: number;
 }
 
 export interface SceneResult {
   summary: string;
   target: TargetObservation | null;
+  /** Bearings (deg, positive = left) of doorways or passages to other rooms; reported only when a target is given. */
+  doorwayBearingsDeg: number[];
 }
 
 /** Extract the JSON object from a model reply that may include <think> blocks, fences or prose. */
@@ -119,11 +126,18 @@ export class Perception {
     }));
   }
 
-  /** Vision-model check that a detected crop matches attributes YOLO cannot see (colour, material...). */
-  async verifyAttributes(image: Buffer, bbox: BBoxNorm, target: TargetSpec, candidates: number): Promise<boolean> {
-    if (target.attributes.length === 0) return true;
-    // With a single candidate in view after a positive check, assume it is the same object.
-    if (this.verifiedOnce && candidates === 1) return true;
+  /**
+   * Vision-model check on a crop of a YOLO detection: attributes YOLO cannot see
+   * (colour, material...) and, for low-confidence detections, the object class itself.
+   * In simulation YOLO often reports rendered furniture as the wrong class (a white sofa as a bed).
+   */
+  async verifyCandidate(image: Buffer, candidate: TargetObservation, target: TargetSpec, candidates: number): Promise<boolean> {
+    const bbox = candidate.bbox;
+    if (!bbox) return false;
+    const lowConfidence = (candidate.confidence ?? 0) < this.opts.verifyBelowConfidence;
+    if (target.attributes.length === 0 && !lowConfidence) return true;
+    // With a single confident candidate in view after a positive check, assume it is the same object.
+    if (!lowConfidence && this.verifiedOnce && candidates === 1) return true;
     const meta = await sharp(image).metadata();
     const w = meta.width ?? 0;
     const h = meta.height ?? 0;
@@ -145,8 +159,10 @@ export class Perception {
             {
               type: "text",
               text:
-                `Does the main object in this crop match "${target.description}" ` +
-                `(attributes to check: ${target.attributes.join(", ")})? Return JSON only: {"match": boolean, "reason": string}`,
+                `Is the main object in this crop a ${target.description}` +
+                (target.attributes.length > 0 ? ` (attributes to check: ${target.attributes.join(", ")})` : "") +
+                "? A similar object is not a match (a sofa is not a bed, a cabinet is not a refrigerator). " +
+                'Return JSON only: {"match": boolean, "reason": string}',
             },
             { type: "image_url", image_url: { url: `data:image/jpeg;base64,${crop.toString("base64")}` } },
           ],
@@ -155,7 +171,9 @@ export class Perception {
     });
     const parsed = parseJsonObject(response.choices[0]?.message.content ?? "");
     const match = parsed?.["match"] === true;
-    process.stderr.write(`[Verify] ${target.description}: ${match ? "match" : "no match"} ${String(parsed?.["reason"] ?? "")}\n`);
+    process.stderr.write(
+      `[Verify] ${target.description} (yolo ${candidate.confidence ?? "?"}): ${match ? "match" : "no match"} ${String(parsed?.["reason"] ?? "")}\n`,
+    );
     if (match) this.verifiedOnce = true;
     return match;
   }
@@ -167,7 +185,8 @@ export class Perception {
   async describe(image: Buffer, goal: string, target: TargetSpec | null): Promise<SceneResult> {
     const url = await toVisionJpeg(image, target !== null);
     const targetSchema = target
-      ? `, "target": {"visible": boolean, "column": integer 1-${GRID_COLUMNS} or null, "apparent_size": "tiny"|"small"|"medium"|"large"|"very_large"|null}`
+      ? `, "target": {"visible": boolean, "column": integer 1-${GRID_COLUMNS} or null, "apparent_size": "tiny"|"small"|"medium"|"large"|"very_large"|null}` +
+        `, "doorways": integer[] (columns 1-${GRID_COLUMNS} showing an interior doorway, open door or corridor leading to another room of the house; not windows, glass walls or doors to the outside; [] if none)`
       : "";
     const response = await this.api.chat.completions.create({
       model: this.opts.visionModel,
@@ -189,7 +208,8 @@ export class Perception {
                 `Robot goal: ${goal}. ` +
                 (target
                   ? `The image is split by blue lines into ${GRID_COLUMNS} numbered columns (1 = far left, ${GRID_COLUMNS} = far right). ` +
-                    `Look for: "${target.description}". Report the column containing its centre, or visible=false if it is not in view. `
+                    `Look for: "${target.description}". Report the column containing its centre, or visible=false if it is not in view. ` +
+                    "Report visible=true only for that object itself, not for a similar one (a sofa is not a bed, a cabinet is not a refrigerator). "
                   : "") +
                 `Schema: {"summary": string (one or two sentences: layout, obstacles, free space, openings)${targetSchema}}`,
             },
@@ -200,12 +220,19 @@ export class Perception {
     });
     const parsed = parseJsonObject(response.choices[0]?.message.content ?? "");
     const summary = typeof parsed?.["summary"] === "string" ? parsed["summary"] : "Vision response was not valid JSON.";
-    if (!target) return { summary, target: null };
+    if (!target) return { summary, target: null, doorwayBearingsDeg: [] };
 
+    const columnBearing = (column: number) =>
+      round(bearingFromImageX((column - 0.5) / GRID_COLUMNS, this.opts.hfovDeg), 1);
+    const doorwayColumns = (Array.isArray(parsed?.["doorways"]) ? (parsed["doorways"] as unknown[]) : [])
+      .map(Number)
+      .filter((c) => Number.isInteger(c) && c >= 1 && c <= GRID_COLUMNS);
+    // A frame "full of doorways" is the model guessing, not seeing: drop it.
+    const doorwayBearingsDeg = doorwayColumns.length <= MAX_DOORWAYS_PER_FRAME ? doorwayColumns.map(columnBearing) : [];
     const t = (parsed?.["target"] ?? {}) as Record<string, unknown>;
     const column = Number(t["column"]);
     if (t["visible"] !== true || !Number.isInteger(column) || column < 1 || column > GRID_COLUMNS) {
-      return { summary, target: { visible: false, source: "vlm" } };
+      return { summary, target: { visible: false, source: "vlm" }, doorwayBearingsDeg };
     }
     const xMin = (column - 1) / GRID_COLUMNS;
     const xMax = column / GRID_COLUMNS;
@@ -220,6 +247,7 @@ export class Perception {
         bbox: { x_min: xMin, y_min: 0.3, x_max: xMax, y_max: 0.55 },
         height_frac: heightFrac,
       },
+      doorwayBearingsDeg,
     };
   }
 

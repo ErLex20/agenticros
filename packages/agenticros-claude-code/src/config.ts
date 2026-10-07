@@ -61,13 +61,23 @@ function tryOpenClawConfig(): Record<string, unknown> | null {
   return null;
 }
 
+/** Relative skillPaths in a config file are relative to that file, not to the cwd. */
+function resolveSkillPaths(config: AgenticROSConfig, configPath: string): AgenticROSConfig {
+  if (!config.skillPaths?.length) return config;
+  const base = path.dirname(configPath);
+  return {
+    ...config,
+    skillPaths: config.skillPaths.map((p) => (path.isAbsolute(p) ? p : path.resolve(base, p))),
+  };
+}
+
 function loadConfigSync(): AgenticROSConfig {
   const primaryPath = getConfigPath();
   try {
     const raw = fs.readFileSync(primaryPath, "utf8");
     const parsed = JSON.parse(raw) as unknown;
     if (parsed !== null && typeof parsed === "object") {
-      const cfg = parseConfig(parsed as Record<string, unknown>);
+      const cfg = resolveSkillPaths(parseConfig(parsed as Record<string, unknown>), primaryPath);
       if (process.stderr && typeof process.stderr.write === "function") {
         process.stderr.write(`[AgenticROS] Config from ${primaryPath}\n`);
       }

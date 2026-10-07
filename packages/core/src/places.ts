@@ -14,6 +14,8 @@ export interface SavedPlace {
   y: number;
   yaw: number;
   frame: string;
+  /** What the place is (room, objects there): lets an agent match "go to the bedroom". */
+  description?: string;
   robot_id?: string;
   updated_at: string;
 }
@@ -25,7 +27,10 @@ export interface PlacesStore {
 
 const STORE_VERSION = 1 as const;
 
+/** AGENTICROS_PLACES_PATH (e.g. a versioned file per map), else ~/.agenticros/places.json. */
 export function defaultPlacesPath(): string {
+  const fromEnv = process.env["AGENTICROS_PLACES_PATH"]?.trim();
+  if (fromEnv) return fromEnv;
   return join(homedir(), ".agenticros", "places.json");
 }
 
@@ -82,6 +87,7 @@ export function savePlace(
     y: number;
     yaw?: number;
     frame?: string;
+    description?: string;
     robot_id?: string;
   },
   path = defaultPlacesPath(),
@@ -97,6 +103,7 @@ export function savePlace(
     y: place.y,
     yaw: Number.isFinite(place.yaw) ? (place.yaw as number) : 0,
     frame: (place.frame ?? "map").trim() || "map",
+    ...(place.description?.trim() ? { description: place.description.trim() } : {}),
     ...(place.robot_id ? { robot_id: place.robot_id } : {}),
     updated_at: new Date().toISOString(),
   };

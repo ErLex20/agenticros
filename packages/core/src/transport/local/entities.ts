@@ -52,8 +52,9 @@ export class EntityCache {
         MessageClass,
         topic,
         (msg: any) => {
+          if (handlers.size === 0) return;
           const plain = fromRosMessage(msg, typeStr);
-          for (const h of handlers) {
+          for (const h of [...handlers]) {
             h(plain);
           }
         },
@@ -63,20 +64,26 @@ export class EntityCache {
       this.subscriptions.set(key, entry);
     }
 
-    entry.handlers.add(handler);
+    const current = entry;
+    current.handlers.add(handler);
 
     return {
       unsubscribe: () => {
-        entry!.handlers.delete(handler);
-        // If no more handlers, destroy the subscription
-        if (entry!.handlers.size === 0) {
+        current.handlers.delete(handler);
+        if (current.handlers.size > 0) return;
+        // Destroying a subscription from inside its own callback (the usual
+        // "take one message" pattern) aborts the process in rclnodejs with a
+        // native "Invalid argument": defer it until the executor has returned.
+        // A subscribe() in the meantime reuses the entry instead.
+        setImmediate(() => {
+          if (current.handlers.size > 0 || this.subscriptions.get(key) !== current) return;
+          this.subscriptions.delete(key);
           try {
-            node.destroySubscription(entry!.handle);
+            node.destroySubscription(current.handle);
           } catch {
             // Already destroyed
           }
-          this.subscriptions.delete(key);
-        }
+        });
       },
     };
   }

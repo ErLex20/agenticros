@@ -38,6 +38,7 @@ import {
   listPlaces,
   savePlaceFromArgs,
   executeNavigateToPlace,
+  cancelNavigation,
 } from "@agenticros/core";
 import { getMissionRegistry } from "./mission-registry.js";
 import { startMotionDebug } from "./motion-debug.js";
@@ -141,6 +142,12 @@ export const TOOLS: McpTool[] = [
     name: "ros2_list_topics",
     description:
       "List all available ROS2 topics and their message types. Use this to discover what data the robot publishes and what commands it accepts.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "ros2_list_actions",
+    description:
+      "List the ROS2 action servers that are running (e.g. /navigate_to_pose when Nav2 is up) with their action types.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -346,7 +353,7 @@ export const TOOLS: McpTool[] = [
   {
     name: "ros2_estop",
     description:
-      "Emergency stop — immediately halt the robot by publishing zero Twist on cmd_vel (five times). Also stops any in-process follow-me loops. Does not cancel a running mission (use mission_cancel for that). Pass robot_id to stop a specific robot; omitted = active robot.",
+      "Emergency stop — immediately halt the robot by publishing zero Twist on cmd_vel (five times). Also stops any in-process follow-me loops and cancels navigation goals (navigate_to / Nav2). Does not cancel a running mission (use mission_cancel for that). Pass robot_id to stop a specific robot; omitted = active robot.",
     inputSchema: {
       type: "object",
       properties: {
@@ -555,7 +562,7 @@ export const TOOLS: McpTool[] = [
   {
     name: "ros2_save_place",
     description:
-      "Save a named map pose for later ros2_navigate_to_place / \"go to the kitchen\". Pass name plus optional x,y,yaw. If x/y are omitted, reads /amcl_pose (or /pose). Stored in ~/.agenticros/places.json.",
+      "Save a named map pose for later ros2_navigate_to_place / \"go to the kitchen\". Pass name plus optional x,y,yaw. If x/y are omitted, reads /amcl_pose (or /pose). Stored in AGENTICROS_PLACES_PATH, else ~/.agenticros/places.json.",
     inputSchema: {
       type: "object",
       properties: {
@@ -564,6 +571,7 @@ export const TOOLS: McpTool[] = [
         y: { type: "number", description: "Map-frame y in meters." },
         yaw: { type: "number", description: "Map-frame yaw in radians." },
         frame: { type: "string", description: "Frame id (default map)." },
+        description: { type: "string", description: "What the place is (room, objects there)." },
         robot_id: { type: "string", description: "Optional robot id (from ros2_list_robots) to scope this call. When omitted, the active robot is used." },
       },
       required: ["name"],
@@ -1190,6 +1198,13 @@ export async function handleToolCall(
   const transport = await getTransportForRobot(config, robot);
 
   switch (name) {
+    case "ros2_list_actions": {
+      const actions = await transport.listActions();
+      return {
+        content: [{ type: "text", text: JSON.stringify({ success: true, count: actions.length, actions }) }],
+      };
+    }
+
     case "ros2_list_topics": {
       const topics = await transport.listTopics();
       const MAX = 50;
@@ -1634,7 +1649,12 @@ export async function handleToolCall(
     case "ros2_estop": {
       await stopFollowMeLocalIfPresent(robot.id);
       await stopFollowMeDepthIfPresent(robot.id);
-      const result = emergencyStopRobot(transport, robot, config);
+      let result = emergencyStopRobot(transport, robot, config);
+      // A navigation goal (Nav2) would command the base again right away:
+      // cancel it, then publish the zero Twist once more.
+      if (await cancelNavigation(config, robot, transport, 1200).catch(() => false)) {
+        result = emergencyStopRobot(transport, robot, config);
+      }
       if (result.skipped === "no_mobile_base") {
         return {
           content: [{

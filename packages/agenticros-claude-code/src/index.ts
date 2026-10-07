@@ -137,8 +137,9 @@ function main(): void {
     const stop = motionUsed
       ? abortTimedMotion().then(() =>
           Promise.race([
+            // ros2_estop also cancels navigation goals (bounded at ~1.2 s).
             handleToolCall("ros2_estop", {}, config ?? loadConfig()).catch(() => undefined),
-            new Promise((resolve) => setTimeout(resolve, 1500)),
+            new Promise((resolve) => setTimeout(resolve, 3000)),
           ]),
         )
       : Promise.resolve();
@@ -150,6 +151,10 @@ function main(): void {
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  // The client went away without a signal (killed, crashed): stdio servers end
+  // with their client. Stop the robot first instead of lingering as an orphan.
+  process.stdin.on("end", shutdown);
+  process.stdin.on("close", shutdown);
 
   run().catch((err) => {
     console.error("AgenticROS MCP server error:", err);

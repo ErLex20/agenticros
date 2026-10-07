@@ -237,8 +237,10 @@ class ExploreNode(Node):
         try:
             return self._run(goal_handle, forced_mode, result)
         finally:
+            # Recent goals are kept across goals: a client exploring one frontier per
+            # goal (max_goals=1) would otherwise get the same unreachable frontier
+            # again and again. Visited frontiers stop being frontiers anyway.
             self._busy = False
-            self._recent_goals.clear()
 
     def _run(
         self,
@@ -341,7 +343,7 @@ class ExploreNode(Node):
             ok = self._send_nav_goal(pose, goal_timeout, goal_handle)
             goals_sent += 1
             self._recent_goals.append((pose.x, pose.y))
-            if len(self._recent_goals) > 8:
+            if len(self._recent_goals) > 16:
                 self._recent_goals.pop(0)
             if goal_handle.is_cancel_requested:
                 result.success = False

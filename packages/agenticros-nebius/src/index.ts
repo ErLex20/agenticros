@@ -85,17 +85,24 @@ async function main(): Promise<void> {
       "[AgenticROS] NEBIUS_DEPTH_TOPIC not set: no obstacle or target distance; advances are limited to short creeps\n",
     );
   }
+  // YOLO confidence trusted without a vision-model check and without a second sighting.
+  const strongConfidence = envNumber("NEBIUS_VERIFY_BELOW_CONFIDENCE", DEFAULT_LIMITS.strongConfidence);
   const perception = new Perception(api, {
     visionModel: envString("NEBIUS_VISION_MODEL") ?? DEFAULT_VISION_MODEL,
     hfovDeg: envPositive("NEBIUS_CAMERA_HFOV_DEG", 110, 179),
     minConfidence: envNumber("NEBIUS_DETECTION_MIN_CONFIDENCE", 0.35),
+    verifyBelowConfidence: strongConfidence,
   });
   const agent = new GoalAgent(api, robot, perception, {
     reasoningModel: envString("NEBIUS_REASONING_MODEL") ?? DEFAULT_REASONING_MODEL,
-    maxSteps: envPositive("NEBIUS_MAX_STEPS", 30),
-    maxSeconds: envPositive("NEBIUS_MAX_SECONDS", 300),
+    maxSteps: envPositive("NEBIUS_MAX_STEPS", 80),
+    maxSeconds: envPositive("NEBIUS_MAX_SECONDS", 600),
     policy: envString("NEBIUS_POLICY") === "auto" ? "auto" : "llm",
-    limits: { ...DEFAULT_LIMITS, stopDistanceM: envPositive("NEBIUS_STOP_DISTANCE_M", DEFAULT_LIMITS.stopDistanceM) },
+    limits: {
+      ...DEFAULT_LIMITS,
+      stopDistanceM: envPositive("NEBIUS_STOP_DISTANCE_M", DEFAULT_LIMITS.stopDistanceM),
+      strongConfidence,
+    },
   });
 
   // Ctrl-C must never leave the robot moving: block further motion commands,

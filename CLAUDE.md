@@ -1,267 +1,152 @@
-# AgenticROS
+# AgenticROS (hackathon-nvidia fork)
 
-## What this is
+AgenticROS is a ROS 2 integration for AI agent platforms: a **core**
+(transport, types, config) plus **adapters** per platform. This fork is used as
+a submodule of `hackathon-nvidia` (`tools/agenticros`), where its main consumer
+is the **Nebius adapter** driving a simulated Unitree Go2 in Gazebo.
 
-AgenticROS is a ROS2 integration for AI agent platforms. It provides a **core** (transport, types, config) and **adapters** per platform.
+The parent repo's `CLAUDE.md` covers the container, the simulation and the
+end-to-end workflow. This file covers the TypeScript monorepo.
 
-- **OpenClaw adapter**: OpenClaw gateway plugin (tools, config UI, teleop HTTP routes)
-- **Claude Code adapter**: MCP server over stdio (Claude Code, Claude Desktop, Dispatch, and OpenAI Codex CLI)
-- **Gemini adapter**: Standalone CLI using Gemini function calling
+## Deployment context (hackathon-nvidia)
 
-## IMPORTANT: Controlling the robot from Claude Code
+- Everything runs inside the DUA dev container (`/home/neo/workspace`); the
+  `ros2` CLI **is** available there and fine for debugging.
+- Transport: **local DDS** (`transport.mode = "local"`, rclnodejs, domain 0),
+  not Zenoh. Config comes from `AGENTICROS_CONFIG_PATH` =
+  `<workspace>/config/agenticros.json`, not `~/.agenticros/config.json`.
+- Robot namespace `""`. Topics:
+  - camera `/dottorcane/slam/zed_x_driver/left/image_rect_color` (Image, 1920×1080, ~110° HFOV)
+  - depth `/dottorcane/slam/zed_x_driver/depth_distances` (32FC1)
+  - cmd_vel `/dottorcane/go2_control/cmd_vel`
+- Safety limits: 0.25 m/s linear and 0.5 rad/s angular (from the parent config).
+- ROS packages are built by the parent workspace through the symlink
+  `src/agenticros -> tools/agenticros/ros2_ws/src`. Do not run `colcon build`
+  inside `ros2_ws/`. Build from the workspace root with the container alias
+  `cbuild` (`colcon build --symlink-install --continue-on-error`), e.g.
+  `cbuild --packages-select agenticros_msgs`, from a shell where `ros2init`
+  has sourced the DUA underlay (interactive shell or `bash -ic`).
+- Commit and push changes here (remote `ErLex20/agenticros`, branch `main`)
+  before bumping the submodule pointer in the parent repo.
 
-**Use MCP tools — never the `ros2` CLI.** The `ros2` CLI is not installed on this machine. The robot is reached via the AgenticROS MCP server over Zenoh.
+## Nebius adapter (`packages/agenticros-nebius/src/`)
 
-Available MCP tools:
-- `ros2_list_topics` — list all topics with types
-- `ros2_publish` — publish a message to a topic
-- `ros2_estop` — emergency stop (zero Twist on cmd_vel; also stops in-process follow-me)
-- `ros2_save_place` / `ros2_list_places` / `ros2_navigate_to_place` — named map places (`~/.agenticros/places.json`)
-- `ros2_subscribe_once` — read one message from a topic
-- `ros2_service_call` — call a ROS2 service
-- `ros2_action_goal` — send an action goal
-- `ros2_param_get` / `ros2_param_set` — get/set node parameters
-- `ros2_camera_snapshot` — capture a camera image
-- `ros2_depth_distance` — sample depth at the center of the depth image
-- `memory_remember` / `memory_recall` / `memory_forget` / `memory_status` — cross-adapter long-term memory (only when `config.memory.enabled` is true). Shared with OpenClaw, Claude Desktop, Codex CLI, and Gemini for the same robot via `~/.mem0/vector_store.db` (mem0 backend) or `~/.agenticros/memory.json` (local backend). See `docs/memory.md`.
+Launched by the parent's `scripts/run_nebius_agent.sh`, which loads `.env` and
+sets the simulation defaults. It spawns the Claude Code MCP server
+(`../agenticros-claude-code/dist/index.js`) as a stdio child and reaches the
+robot **only** through its tools (`ros2_camera_snapshot`,
+`ros2_depth_distance`, `ros2_move_for`, `ros2_estop`), so the AgenticROS safety
+clamps always apply.
 
-**Robot namespace**: none (default `""`) — check `~/.agenticros/config.json` `robot.namespace` if this changes
-**cmd_vel topic**: `/cmd_vel`
+| File | Purpose |
+|------|---------|
+| `index.ts` | Entry point: env parsing (`NEBIUS_*`), MCP client spawn, always `ros2_estop` on exit |
+| `agent.ts` | `GoalAgent`: observe → decide → act loop with Nemotron tool calls, bounded by steps, time and a full search turn |
+| `perception.ts` | Tiled YOLO for COCO targets; MiniCPM-V with a numbered column grid for non-COCO targets and colour checks; depth sampling |
+| `policy.ts` | Pure helpers (camera geometry, intent → bounded motion, goal test, deterministic fallback). No ROS, no network |
+| `robot.ts` | Thin wrappers around the MCP tools; turn/forward efficiency compensation for the legged base |
+| `__tests__/policy.test.ts` | Offline unit tests for `policy.ts` |
+
+Rules:
+- Keep geometry and safety decisions in deterministic code (`policy.ts`). The
+  LLM picks semantic intents (`search` / `face_target` / `approach_target` /
+  `finish`); the controller bounds, clamps or rejects them.
+- The model never sees ground-truth pose. `AGENTICROS_DEBUG_POSE_TOPIC` is
+  logging-only diagnostics.
+- Logs go to stderr (`[Goal]`, `[Step N]`, `[Scene]`, `[Decision]`,
+  `[Timing]`); stdout carries only the final answer in Italian.
+- Never print or log `NEBIUS_API_KEY`.
+
+```bash
+pnpm --filter @agenticros/nebius build      # required: the agent runs from dist/
+pnpm --filter @agenticros/nebius test       # runs dist/__tests__, so build first
+```
 
 ## Architecture
 
 ```
 packages/
   core/                    # @agenticros/core — transport, types, Zod config (no platform deps)
-  ros-camera/              # @agenticros/ros-camera — shared camera snapshot encoding (Image / CompressedImage)
-  object-detection/        # @agenticros/object-detection — shared YOLOv8n COCO detector + find-object scan routine
-  agenticros/              # @agenticros/agenticros — OpenClaw plugin
-  agenticros-claude-code/  # @agenticros/claude-code — MCP server (stdio; Claude Code, Desktop, Dispatch, Codex CLI)
-  agenticros-gemini/       # @agenticros/gemini — Gemini CLI
-  agenticros-cli/          # agenticros — orchestrator CLI
-  robot-eyes/              # @agenticros/eyes — on-robot face display + WASD (local DDS)
+  ros-camera/              # @agenticros/ros-camera — camera snapshot encoding (Image / CompressedImage)
+  object-detection/        # @agenticros/object-detection — YOLOv8n COCO detector + find-object scan
+  agenticros-nebius/       # @agenticros/nebius — Nebius Token Factory goal-loop agent (used here)
+  agenticros-claude-code/  # @agenticros/claude-code — MCP server (stdio); also the Nebius agent's robot backend
+  agenticros/              # @agenticros/agenticros — OpenClaw plugin (upstream, unused here)
+  agenticros-gemini/       # @agenticros/gemini — Gemini CLI (upstream, unused here)
+  agenticros-cli/          # agenticros — orchestrator CLI (`agenticros doctor`)
+  robot-eyes/              # @agenticros/eyes — on-robot face display (upstream, unused here)
 ros2_ws/src/
-  agenticros_msgs/         # Custom ROS2 messages & services
+  agenticros_msgs/         # Custom ROS 2 messages & services
   agenticros_discovery/    # Capability discovery node (Python)
-  agenticros_agent/        # WebRTC agent node, Mode C (Python)
+  agenticros_agent/        # WebRTC agent node (Python)
   agenticros_follow_me/    # Follow Me mission (Python)
-docs/                      # Architecture, skills, setup guides
-scripts/                   # Workspace and gateway setup
-docker/                    # Docker Compose and Dockerfiles
 ```
-
-## Key source files
 
 ### Core (`packages/core/src/`)
 | File | Purpose |
 |------|---------|
-| `config.ts` | Zod config schema — all transport modes, robot, safety, skills |
-| `transport/factory.ts` | `createTransport(config)` — picks implementation by mode |
-| `transport/transport.ts` | `RosTransport` interface (the contract all adapters share) |
-| `transport/types.ts` | Shared types: `ConnectionStatus`, `PublishOptions`, `TopicInfo`, etc. |
-| `transport/zenoh/adapter.ts` | Zenoh transport (binary CDR, Eclipse Zenoh) |
-| `transport/rosbridge/adapter.ts` | Rosbridge transport (WebSocket, JSON) |
-| `transport/webrtc/transport.ts` | WebRTC transport (cloud/remote Mode C) |
-| `transport/local/transport.ts` | Local DDS transport via rclnodejs |
+| `config.ts` | Zod config schema: transport modes, robot, safety, skills |
+| `transport/factory.ts` | `createTransport(config)`: picks the implementation by mode |
+| `transport/transport.ts` | `RosTransport` interface shared by all adapters |
+| `transport/local/transport.ts` | Local DDS transport via rclnodejs (**used here**) |
+| `transport/zenoh/`, `rosbridge/`, `webrtc/` | Other transports |
 | `topic-utils.ts` | Namespace prefix helpers |
-| `index.ts` | Public API re-exports |
-
-### Camera package (`packages/ros-camera/src/`)
-Shared camera snapshot encoding used by all adapters — handles both `sensor_msgs/Image` and `sensor_msgs/CompressedImage`.
-
-### Object detection package (`packages/object-detection/src/`)
-Shared YOLOv8n COCO-class detector (`detector.ts` — ONNX model load/download, letterbox resize, inference, NMS) and the rotate-in-place `findObject()` scan routine (`find-object.ts`) used by every adapter's `ros2_find_object` tool. Extracted here after the same three bugs (dead model URL, motion-blur-inducing continuous rotation, raw/compressed topic mismatch) had to be fixed twice in duplicated per-adapter copies.
 
 ### Claude Code MCP server (`packages/agenticros-claude-code/src/`)
 | File | Purpose |
 |------|---------|
-| `index.ts` | Entry point — `StdioServerTransport`, registers tool handlers |
-| `tools.ts` | All 9 MCP tool definitions + execution handlers |
-| `config.ts` | Load config from env / `~/.agenticros/config.json` / OpenClaw fallback |
-| `transport.ts` | Connect/disconnect lifecycle |
-| `safety.ts` | Velocity safety validation before publish |
-| `depth.ts` | Depth image sampling helper |
+| `index.ts` | Entry point: `StdioServerTransport`, tool handlers |
+| `tools.ts` | Tool definitions + handlers (`ros2_move_for`, `ros2_camera_snapshot`, `ros2_depth_distance`, `ros2_estop`, …) |
+| `config.ts` | Config loading (env / `AGENTICROS_CONFIG_PATH` / `~/.agenticros/config.json`) |
+| `safety.ts` | Velocity clamps applied before every publish |
+| `depth.ts` | Depth image sampling |
 
-### OpenClaw plugin (`packages/agenticros/src/`)
-| File | Purpose |
-|------|---------|
-| `index.ts` | Plugin registration, config loading |
-| `tools/index.ts` | Register all 10 tools with OpenClaw |
-| `tools/ros2-publish.ts` | Publish tool |
-| `tools/ros2-camera.ts` | Camera snapshot tool |
-| `tools/ros2-depth-distance.ts` | Depth distance tool |
-| `tools/ros2-find-object.ts` | Find-object (YOLO rotate-and-scan) tool |
-| `service.ts` | Transport lifecycle for the plugin |
-| `safety/validator.ts` | Velocity safety guard |
-| `skill-loader.ts` | Dynamic skill package loading |
-| `config-page.ts` | Web config UI |
-| `routes.ts` | HTTP routes: `/agenticros/config`, `/agenticros/teleop/` |
+After editing it, rebuild with `pnpm --filter @agenticros/claude-code build`:
+both the MCP server and the Nebius agent run it from `dist/`.
 
 ## Conventions
 
 - **ESM only**, TypeScript strict, NodeNext module resolution
-- **pnpm workspaces**: `packages/*`
-- **npm scope**: `@agenticros/`
-- **ROS2 package prefix**: `agenticros_`
-- All transports implement the `RosTransport` interface from `@agenticros/core`
-- Config validated with Zod; defaults applied in the schema — never assume a field is set
-- Dynamic imports in factory to avoid loading unused transport deps
+- pnpm workspaces (`packages/*`), npm scope `@agenticros/`, ROS package prefix `agenticros_`
+- Every transport implements `RosTransport` from `@agenticros/core`
+- Config is validated with Zod and defaults live in the schema; never assume a field is set
+- Shared ML or inference logic goes in a shared package (e.g. `object-detection`), not in per-adapter copies
 
-## Adapters
-
-- **OpenClaw** (`packages/agenticros`): Plugin for the OpenClaw gateway — tools, config UI, teleop web page. See "Loading the OpenClaw plugin" below.
-- **Claude Code CLI** (`packages/agenticros-claude-code`): MCP server over stdio for **Claude Code** (terminal), **Claude Desktop** / **Dispatch**, and **OpenAI Codex CLI**. Claude: `.mcp.json` or `~/Library/Application Support/Claude/claude_desktop_config.json`. Codex: `agenticros codex setup` → `~/.codex/config.toml`. Setup: [packages/agenticros-claude-code/README.md](packages/agenticros-claude-code/README.md), [docs/codex-setup.md](docs/codex-setup.md).
-- **Gemini CLI** (`packages/agenticros-gemini`): Standalone CLI using Google Gemini and function calling to chat with the robot (no MCP). Setup: [packages/agenticros-gemini/README.md](packages/agenticros-gemini/README.md). Requires `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
-
-## Build & development commands
+## Build & development
 
 ```bash
-# From repo root
-pnpm install                                      # Install all workspace deps
-pnpm build                                        # Build all packages
-pnpm typecheck                                    # Type-check all packages
-pnpm test                                         # Run all unit + integration tests
-pnpm clean                                        # Remove dist/ and .tsbuildinfo files
-pnpm lint                                         # Lint all packages
-pnpm mcp:kill                                     # Kill a running MCP server process
-pnpm refresh:skills                               # Repair stale pnpm hardlinks in external skill repos
-pnpm deploy:plugin                                # Redeploy the OpenClaw plugin (auto-refreshes skills)
-
-# Per-package (filter syntax)
-pnpm --filter @agenticros/core build
-pnpm --filter @agenticros/ros-camera build
-pnpm --filter @agenticros/object-detection build
-pnpm --filter @agenticros/claude-code typecheck
-pnpm --filter @agenticros/claude-code build       # Required after editing claude-code src
+pnpm install          # workspace deps (pinned pnpm 9.15.4)
+pnpm build            # all packages
+pnpm typecheck
+pnpm test
+pnpm --filter <pkg> build
 ```
 
-After editing `packages/agenticros-claude-code/src/`, always run `pnpm --filter @agenticros/claude-code build` before testing — the MCP server runs from `dist/index.js`.
+The parent's `agenticros_setup` (`bin/setup_agenticros.sh`) runs the full
+setup: colcon build of the parent workspace plus pnpm install/build.
 
-**External skill repos and the pnpm hardlink cascade**: Skills like `agenticros-skill-followme` and `agenticros-skill-find` consume `@agenticros/core` via `file:` deps. pnpm hardlinks them through a virtual store snapshot that is NOT auto-refreshed when `packages/core/dist/` gains new files. After adding new exports to `@agenticros/core`, run `pnpm refresh:skills` (or `pnpm deploy:plugin`, which includes it) to keep external skills in lockstep. `sync-skill-tools.mjs` will detect the cascade signature and preserve the previous manifest's skill tools instead of silently stripping them.
+## Configuration
 
-The same hardlink-snapshot trap also bites `~/.agenticros/plugin-deploy/`, which is the flattened tree OpenClaw loads the plugin from. `pnpm deploy --prod` snapshots `@agenticros/core/dist/` into the virtual store at deploy time and is NOT refreshed afterward. Two situations leave it stale and silently break the plugin:
-- A new file is added to `packages/core/dist/` (e.g. a fresh `mission-registry.js`) and `index.js` starts importing it — the deployed snapshot still lacks the file → `Cannot find module './mission-registry.js'` → plugin fails to load → no `ros2_*` tools registered → agent falls back to bash/CLI for robot control with no safety clamps.
-- OpenClaw self-updates (e.g. `openclaw update`) and re-loads plugins from disk, re-exposing the stale snapshot. The update can fire at unpredictable times mid-session; the first symptom is usually MCP tools vanishing from the agent's tool list and `tools.profile (...) allowlist contains unknown entries (ros2_publish, ...)` warnings in `/tmp/openclaw/openclaw-*.log`.
+Load order: `AGENTICROS_CONFIG_PATH` → `~/.agenticros/config.json` → OpenClaw
+config. `AGENTICROS_ROBOT_NAMESPACE` overrides the namespace at runtime.
 
-Always re-run `pnpm deploy:plugin` after either of: (a) any change to `@agenticros/core`'s exports, or (b) an OpenClaw self-update. Check plugin health with `rg -i "agenticros (failed|loaded successfully)" /tmp/openclaw/openclaw-*.log | tail -5`.
+## Adding a ROS 2 tool
 
-## Configuration system
-
-Config is loaded (in priority order):
-1. `AGENTICROS_CONFIG_PATH` env var path
-2. `~/.agenticros/config.json`
-3. OpenClaw config: `plugins.entries.agenticros.config` in `~/.openclaw/openclaw.json` or `OPENCLAW_CONFIG`
-
-Override robot namespace at runtime:
-```bash
-AGENTICROS_ROBOT_NAMESPACE=<namespace> node dist/index.js
-```
-
-Key config fields (all have defaults in `packages/core/src/config.ts`):
-```jsonc
-{
-  "transport": { "mode": "zenoh" },         // rosbridge | local | webrtc | zenoh
-  "zenoh": { "routerEndpoint": "ws://localhost:10000" },
-  "rosbridge": { "url": "ws://localhost:9090" },
-  "robot": { "namespace": "...", "name": "Robot", "cameraTopic": "..." },
-  "safety": { "maxLinearVelocity": 1.0, "maxAngularVelocity": 1.5 },
-  "teleop": { "cmdVelTopic": "...", "speedDefault": 0.3 }
-}
-```
-
-## MCP server setup
-
-**Project-scoped** (`.mcp.json` at repo root — already configured):
-```json
-{
-  "mcpServers": {
-    "agenticros": {
-      "type": "stdio",
-      "command": "sh",
-      "args": ["-c", "node packages/agenticros-claude-code/dist/index.js 2>>/tmp/agenticros-mcp.log"],
-      "env": { "AGENTICROS_ROBOT_NAMESPACE": "" }
-    }
-  }
-}
-```
-Namespace is left empty here on purpose — it's driven by `~/.agenticros/config.json` (`robot.namespace`), swappable per-mode via `agenticros config use <real|sim>` / `agenticros mode <real|sim>`. Setting it in `.mcp.json` would force the same namespace for both real-robot and sim runs.
-
-**Desktop app**: `~/Library/Application Support/Claude/claude_desktop_config.json` — use absolute path to `dist/index.js`.
-
-**Codex CLI**: `~/.codex/config.toml` or project `.codex/config.toml` — run `agenticros codex setup` (absolute path required). See [docs/codex-setup.md](docs/codex-setup.md).
-
-MCP server logs: `/tmp/agenticros-mcp.log`
-
-## Adding a new ROS2 tool
-
-Tools are mirrored across three adapters. Add to all three:
-
-1. **Core** — no changes needed (transport handles arbitrary topics/services)
-   - If the tool needs local ML inference shared across adapters, put the model/inference logic in a new or existing shared package (e.g. `@agenticros/object-detection`) instead of duplicating it — see that package for the precedent.
-2. **Claude Code** (`packages/agenticros-claude-code/src/tools.ts`):
-   - Add tool definition to the `tools` array (name, description, inputSchema)
-   - Add handler in the `switch` in `callTool`
-3. **OpenClaw** (`packages/agenticros/src/tools/`):
-   - Add `ros2-<name>.ts` implementing the OpenClaw tool contract
-   - Register in `src/tools/index.ts`
-4. **Gemini** (`packages/agenticros-gemini/src/tools.ts`):
-   - Add function declaration + handler
-
-## Adding a new transport
-
-1. Create `packages/core/src/transport/<name>/adapter.ts` implementing `RosTransport`
-2. Add the mode to the Zod config union in `packages/core/src/config.ts`
-3. Add a dynamic import case in `packages/core/src/transport/factory.ts`
-
-## Adding a new adapter (agent platform)
-
-1. Create `packages/agenticros-<platform>/` with `package.json` depending on `@agenticros/core` (and `@agenticros/ros-camera` if you need `ros2_camera_snapshot`, `@agenticros/object-detection` if you need `ros2_find_object`)
-2. Implement that platform's plugin/extension contract
-3. Use `createTransport(config)` from core
-4. Mirror the tool set from `packages/agenticros-claude-code/src/tools.ts` as a reference
-
-## Loading the OpenClaw plugin
-
-- **One-shot install**: `./scripts/setup_gateway_plugin.sh` — installs workspace deps, builds the required packages, flattens the plugin via `pnpm deploy --prod` into `~/.agenticros/plugin-deploy`, links it with `openclaw plugins install -l`, and restarts the gateway. Flags: `--transport`, `--rosbridge-url`, `--zenoh-endpoint`, `--robot-namespace`, `--camera-topic`, `--skip-build`, `--no-restart`.
-- **Why the deploy step is required (OpenClaw 2026.6+)**: the install-time code safety scan rejects any `node_modules/*` symlink that resolves outside the plugin install root. pnpm workspace symlinks always trip this, so `openclaw plugins install -l ./packages/agenticros` no longer works against the source tree — `pnpm --filter ./packages/agenticros deploy --prod <dir>` produces a flat tree with all deps contained inside.
-- **Default transport mode is `local`** (DDS direct via rclnodejs). Override with `--transport rosbridge|zenoh|webrtc` when the gateway runs off-robot.
-- **Config**: In the OpenClaw config file (e.g. `~/.openclaw/openclaw.json` or `OPENCLAW_CONFIG`), the AgenticROS plugin config lives under `plugins.entries.agenticros.config`. The config UI is at `/agenticros/config` when the gateway is running.
-
-## ROS2 workspace (Python nodes)
-
-```bash
-# Build (from ros2_ws/)
-colcon build --symlink-install
-
-# Source
-source install/setup.bash
-
-# Run nodes
-ros2 run agenticros_discovery discovery_node
-ros2 run agenticros_follow_me follow_me_node
-```
-
-Custom messages are in `ros2_ws/src/agenticros_msgs/msg/` and `srv/`.
+Add it to `packages/agenticros-claude-code/src/tools.ts` (definition +
+`callTool` handler); the Nebius agent then uses it through `robot.ts`. The
+upstream OpenClaw (`packages/agenticros/src/tools/`) and Gemini adapters mirror
+the same tool set; update them only if you intend to upstream the change.
 
 ## Safety
 
-All velocity publishes go through a safety validator (both in claude-code and OpenClaw adapters):
-- `maxLinearVelocity` (default 1.0 m/s)
-- `maxAngularVelocity` (default 1.5 rad/s)
-
-Clamps are enforced in `packages/agenticros-claude-code/src/safety.ts` and `packages/agenticros/src/safety/validator.ts`.
+All velocity publishes go through the validator in
+`packages/agenticros-claude-code/src/safety.ts` (`maxLinearVelocity`,
+`maxAngularVelocity` from config). `ros2_move_for` always ends with a stop, and
+the MCP server stops in-flight motions on shutdown. Do not bypass these by
+publishing cmd_vel directly from adapter code.
 
 ## Docs
 
-| File | Contents |
-|------|---------|
-| `docs/architecture.md` | Full system architecture |
-| `docs/codex-setup.md` | OpenAI Codex CLI setup (`agenticros codex setup`) |
-| `docs/local-vlm.md` | Local Ollama VLM setup for OpenClaw / Hermes (no cloud API keys) |
-| `docs/cli.md` | `agenticros` CLI reference (includes `codex setup` / `codex doctor`) |
-| `docs/skills.md` | Skill development guide |
-| `docs/robot-setup.md` | Hardware/software setup |
-| `docs/zenoh-agenticros.md` | Zenoh integration |
-| `docs/cameras.md` | Camera configuration |
-| `docs/teleop.md` | Teleop web app setup |
-| `docs/eyes.md` | On-robot eyes display (`agenticros eyes`) |
+`docs/architecture.md`, `docs/cli.md`, `docs/cameras.md`, `docs/skills.md`,
+`docs/robot-setup.md`. Nebius and simulation docs live in the parent repo
+(`docs/NEBIUS_AGENTICROS.md`, `docs/GAZEBO_SETUP.md`, `src/README.md`).

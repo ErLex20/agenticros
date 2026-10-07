@@ -76,6 +76,7 @@ export async function savePlaceFromArgs(
     y,
     yaw,
     frame: typeof args["frame"] === "string" ? args["frame"] : "map",
+    ...(typeof args["description"] === "string" ? { description: args["description"] } : {}),
     robot_id: opts.robot.id,
   });
 }
@@ -118,4 +119,43 @@ export async function executeNavigateToPlace(
     },
   );
   return { ...result, place };
+}
+
+/** action_msgs CancelGoal with a zero goal id and stamp: cancel every goal of the server. */
+const CANCEL_ALL_GOALS = {
+  goal_info: { goal_id: { uuid: new Array(16).fill(0) }, stamp: { sec: 0, nanosec: 0 } },
+};
+
+/**
+ * Stop navigation for an emergency stop: cancel the goals this transport sent
+ * and ask the navigate_to action server (e.g. Nav2) to cancel every goal, also
+ * those sent by other clients. Otherwise the planner keeps commanding the base
+ * right after a zero cmd_vel. Best effort and bounded in time; a no-op when no
+ * navigate_to capability is configured.
+ */
+export async function cancelNavigation(
+  config: AgenticROSConfig,
+  robot: ResolvedRobot,
+  transport: RosTransport,
+  timeoutMs = 1500,
+): Promise<boolean> {
+  const cap = findNavigateToCapability(config, robot.id);
+  const action = cap?.implementation?.kind === "external_ros_node" ? cap.implementation.action : undefined;
+  if (!action) return false;
+  const name = toNamespacedTopicFull(robot.namespace, action.startsWith("/") ? action : `/${action}`);
+  const cancelAll = Promise.allSettled([
+    transport.cancelAllActionGoals?.() ?? transport.cancelActionGoal(name),
+    transport.callService({
+      service: `${name}/_action/cancel_goal`,
+      type: "action_msgs/srv/CancelGoal",
+      args: CANCEL_ALL_GOALS,
+    }),
+  ]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  await Promise.race([cancelAll, timeout]);
+  if (timer) clearTimeout(timer);
+  return true;
 }
