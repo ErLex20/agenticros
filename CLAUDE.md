@@ -24,7 +24,7 @@ Launched by the parent's `scripts/run_nebius_agent.sh`, which loads `.env` and s
 |------|---------|
 | `index.ts` | Entry point: env parsing (`NEBIUS_*`), MCP client spawn, always `ros2_estop` on exit |
 | `agent.ts` | `GoalAgent`: observe → decide → act loop with Nemotron tool calls, bounded by steps, time and a full search turn |
-| `perception.ts` | Target localization: the vision model (default, `NEBIUS_PERCEPTION=vlm`), plus tiled YOLO for COCO targets with `NEBIUS_PERCEPTION=yolo`; the vision model which returns a bounding box (Kimi-K2.6) or a numbered column (MiniCPM-V); crop checks of attributes and doubtful sightings |
+| `perception.ts` | Target localization by the vision model (default `NEBIUS_PERCEPTION=vlm`; `yolo` adds tiled YOLO for COCO targets). The vision model returns a bounding box (Kimi-K2.6, default) or a numbered column (MiniCPM-V), per its profile; crop checks of attributes and of vision-model sightings at confirmation and arrival |
 | `vision.ts` | Pure helpers: per-model vision profiles (grounding, image width, provider fields such as disabling Kimi's thinking), robust JSON extraction, box normalization, reply schema |
 | `policy.ts` | Pure helpers (camera geometry, intent → bounded motion, goal test, deterministic fallback). No ROS, no network |
 | `robot.ts` | Thin wrappers around the MCP tools; turn/forward efficiency compensation for the legged base |
@@ -35,6 +35,10 @@ Rules:
 - The model never sees ground-truth pose. `AGENTICROS_DEBUG_POSE_TOPIC` is logging-only diagnostics.
 - Logs go to stderr (`[Goal]`, `[Step N]`, `[Scene]`, `[Decision]`, `[Timing]`); stdout carries only the final answer in Italian.
 - Never print or log `NEBIUS_API_KEY`.
+- Every vision-model call goes through `Perception.ask()`, which applies the model profile from `vision.ts` (e.g. Kimi-K2.6 thinks by default and needs `chat_template_kwargs: {thinking: false}`). A new vision model needs a profile there and a measurement with the parent's `scripts/vision_eval/` before becoming the default.
+- Geometry rules depend on `TargetObservation.localization` (`box` = tight box from YOLO or a grounding model, `column` = coarse band), not on `source`. `source` only drives trust (YOLO ≥ 0.8 confirmed at once, everything else needs two consecutive frames).
+- Keep the arrival guards: `depthConsistentWithBox` (depth reading an occluder), the 0.5 m cap when the target distance is unknown, and the crop check of vision-model sightings. Each one fixed a false arrival seen in simulation (parent `docs/CHANGELOG_PERCEZIONE_VLM.md`).
+- Commits: no Claude co-author (`Co-Authored-By`).
 
 ```bash
 pnpm --filter @agenticros/nebius build      # required: the agent runs from dist/
