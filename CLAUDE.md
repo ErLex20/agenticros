@@ -13,7 +13,7 @@ The parent repo's `CLAUDE.md` covers the container, the simulation and the end-t
   - depth `/dottorcane/slam/zed_x_driver/depth_distances` (32FC1)
   - cmd_vel `/dottorcane/go2_control/cmd_vel`
 - Safety limits: 0.25 m/s linear and 0.5 rad/s angular (from the parent config).
-- ROS packages are built by the parent workspace through the symlink `src/agenticros -> tools/agenticros/ros2_ws/src`. Do not run `colcon build` inside `ros2_ws/`. Build from the workspace root with the container alias `cbuild` (`colcon build --symlink-install --continue-on-error`), e.g. `cbuild --packages-select agenticros_msgs`, from a shell where `ros2init` has sourced the DUA underlay (interactive shell or `bash -ic`).
+- ROS packages are built by the parent workspace through the symlink `src/agenticros -> tools/agenticros/ros2_ws/src`. Do not run `colcon build` inside `ros2_ws/`. Build from the workspace root with the container alias `cbuild` (`colcon build --event-handlers console_direct+ --symlink-install --continue-on-error`), e.g. `cbuild --packages-select agenticros_msgs`, from a shell where `ros2init` has sourced the DUA underlay (interactive shell or `bash -ic`).
 - Commit and push changes here (remote `ErLex20/agenticros`, branch `main`) before bumping the submodule pointer in the parent repo.
 
 ## Nebius adapter (`packages/agenticros-nebius/src/`)
@@ -37,7 +37,7 @@ Rules:
 - Never print or log `NEBIUS_API_KEY`.
 - Every vision-model call goes through `Perception.ask()`, which applies the model profile from `vision.ts` (e.g. Kimi-K2.6 thinks by default and needs `chat_template_kwargs: {thinking: false}`). A new vision model needs a profile there and a measurement with the parent's `scripts/vision_eval/` before becoming the default.
 - Geometry rules depend on `TargetObservation.localization` (`box` = tight box from YOLO or a grounding model, `column` = coarse band), not on `source`. `source` only drives trust (YOLO ≥ 0.8 confirmed at once, everything else needs two consecutive frames).
-- Keep the arrival guards: `depthConsistentWithBox` (depth reading an occluder), the 0.5 m cap when the target distance is unknown, and the crop check of vision-model sightings. Each one fixed a false arrival seen in simulation (parent `docs/CHANGELOG_PERCEZIONE_VLM.md`).
+- Keep the arrival guards: `depthConsistentWithBox` (depth reading an occluder), the 0.5 m cap when the target distance is unknown, and the crop check of vision-model sightings. Each one fixed a false arrival seen in simulation (parent `docs/CHANGELOG.md`).
 - Commits: no Claude co-author (`Co-Authored-By`).
 
 ```bash

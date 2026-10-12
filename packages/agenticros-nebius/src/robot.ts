@@ -45,6 +45,9 @@ export interface NavigationCapabilities {
 /** ROS action of agenticros_explore (go2_sim.launch.py nav:=slam). */
 const EXPLORE_ACTION = "/explore";
 const EXPLORE_ACTION_TYPE = "agenticros_msgs/action/Explore";
+/** Extra ros2_list_actions calls when Nav2 is missing; each waits for the graph to settle again. */
+const NAV_DISCOVERY_RETRIES = 2;
+const NAV_DISCOVERY_RETRY_MS = 1000;
 /** A frontier trip that ends sooner than this did not move the robot. */
 const MIN_FRONTIER_TRIP_MS = 3000;
 
@@ -160,8 +163,23 @@ export class RobotTools {
     }
   }
 
-  /** Which navigation action servers (Nav2, frontier exploration) are running. */
+  /**
+   * Which navigation action servers (Nav2, frontier exploration) are running.
+   * DDS discovery in a fresh process sometimes settles on a partial graph
+   * (measured: 19 of 98 topics in 1 run of 8 with Nav2 up), so a missing Nav2
+   * is checked again before the agent falls back to vision-only navigation.
+   */
   async navigationCapabilities(): Promise<NavigationCapabilities> {
+    let caps = await this.listNavigationActions();
+    for (let retry = 1; !caps.navigate && retry <= NAV_DISCOVERY_RETRIES; retry++) {
+      process.stderr.write(`[Navigation] Nav2 not seen on the ROS graph, retrying discovery (${retry}/${NAV_DISCOVERY_RETRIES})\n`);
+      await new Promise<void>((resolve) => setTimeout(resolve, NAV_DISCOVERY_RETRY_MS));
+      caps = await this.listNavigationActions();
+    }
+    return caps;
+  }
+
+  private async listNavigationActions(): Promise<NavigationCapabilities> {
     const none = { navigate: false, explore: false };
     const { text, isError } = await this.call("ros2_list_actions", {});
     if (isError) return none;
