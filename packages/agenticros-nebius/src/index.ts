@@ -97,7 +97,7 @@ async function main(): Promise<void> {
   }
   // YOLO confidence trusted without a vision-model check and without a second sighting.
   const strongConfidence = envNumber("NEBIUS_VERIFY_BELOW_CONFIDENCE", DEFAULT_LIMITS.strongConfidence);
-  const perceptionMode: PerceptionMode = envChoice("NEBIUS_PERCEPTION", ["yolo", "vlm"] as const) ?? "yolo";
+  const perceptionMode: PerceptionMode = envChoice("NEBIUS_PERCEPTION", ["yolo", "vlm"] as const) ?? "vlm";
   const visionModel = envString("NEBIUS_VISION_MODEL") ?? DEFAULT_VISION_MODEL;
   const vision = visionProfile(visionModel, envChoice<Grounding>("NEBIUS_VISION_GROUNDING", ["box", "columns"] as const));
   process.stderr.write(

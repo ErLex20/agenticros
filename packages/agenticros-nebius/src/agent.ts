@@ -71,7 +71,7 @@ export interface AgentConfig {
   limits: PolicyLimits;
   /** "llm": Nemotron decides each step; "auto": deterministic policy only (debugging). */
   policy: "llm" | "auto";
-  /** "yolo": local detector for COCO targets plus the vision model; "vlm": vision model only. */
+  /** "vlm" (default): vision model only; "yolo": local detector for COCO targets plus the vision model. */
   perception: PerceptionMode;
   camera: CameraGeometry;
 }

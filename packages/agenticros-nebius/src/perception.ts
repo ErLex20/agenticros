@@ -2,10 +2,10 @@
  * Target perception for the goal loop.
  *
  * Two modes (NEBIUS_PERCEPTION):
+ * - "vlm" (default): no local detector. The Nebius vision model localizes every target.
  * - "yolo": COCO targets use the local YOLO detector of @agenticros/object-detection
  *   with a tiled pass; other targets, COCO targets YOLO misses and attribute checks
  *   use the Nebius vision model.
- * - "vlm": no local detector. The Nebius vision model localizes every target.
  *
  * How the vision model localizes depends on its profile (vision.ts): models that
  * ground (Kimi-K2.6) return a bounding box; the others get a frame overlaid with

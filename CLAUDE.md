@@ -24,7 +24,7 @@ Launched by the parent's `scripts/run_nebius_agent.sh`, which loads `.env` and s
 |------|---------|
 | `index.ts` | Entry point: env parsing (`NEBIUS_*`), MCP client spawn, always `ros2_estop` on exit |
 | `agent.ts` | `GoalAgent`: observe → decide → act loop with Nemotron tool calls, bounded by steps, time and a full search turn |
-| `perception.ts` | Target localization: tiled YOLO for COCO targets (`NEBIUS_PERCEPTION=yolo`) plus the vision model, which returns a bounding box (Kimi-K2.6) or a numbered column (MiniCPM-V); crop checks of attributes and doubtful sightings |
+| `perception.ts` | Target localization: the vision model (default, `NEBIUS_PERCEPTION=vlm`), plus tiled YOLO for COCO targets with `NEBIUS_PERCEPTION=yolo`; the vision model which returns a bounding box (Kimi-K2.6) or a numbered column (MiniCPM-V); crop checks of attributes and doubtful sightings |
 | `vision.ts` | Pure helpers: per-model vision profiles (grounding, image width, provider fields such as disabling Kimi's thinking), robust JSON extraction, box normalization, reply schema |
 | `policy.ts` | Pure helpers (camera geometry, intent → bounded motion, goal test, deterministic fallback). No ROS, no network |
 | `robot.ts` | Thin wrappers around the MCP tools; turn/forward efficiency compensation for the legged base |
