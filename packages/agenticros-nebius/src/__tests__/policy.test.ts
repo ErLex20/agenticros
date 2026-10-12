@@ -86,8 +86,11 @@ test("off-axis advances and premature success are rejected", () => {
   // A near reading at the image edge is not "arrived".
   assert.equal(isGoalReached(visibleAt(-50, 1.1), DEFAULT_LIMITS), false);
   // A vision-model column band may contain a nearer object: a small target is not "arrived".
-  const vlmSmall = obs({ target: { visible: true, source: "vlm", bearing_deg: 0, distance_m: 1.1, height_frac: 0.12 } });
+  const vlmSmall = obs({ target: { visible: true, source: "vlm", localization: "column", bearing_deg: 0, distance_m: 1.1, height_frac: 0.12 } });
   assert.equal(isGoalReached(vlmSmall, DEFAULT_LIMITS), false);
+  // A grounding model's box bounds the target itself: depth in it is the target's, like a detector box.
+  const vlmBox = obs({ target: { visible: true, source: "vlm", localization: "box", bearing_deg: 0, distance_m: 1.1, height_frac: 0.12 } });
+  assert.equal(isGoalReached(vlmBox, DEFAULT_LIMITS), true);
   assert.equal(planIntent({ kind: "advance", meters: 0.01 }, visibleAt(0, 3), DEFAULT_LIMITS, search).ok, false);
 });
 
@@ -295,9 +298,46 @@ test("an unconfirmed sighting blocked by an obstacle does not end the search", (
 });
 
 test("approach steps are not crawled 10 cm at a time", () => {
-  const plan = planIntent({ kind: "approach_target", meters: 0.1 }, visibleAt(2, 4), DEFAULT_LIMITS, search);
+  const plan = planIntent({ kind: "approach_target", meters: 0.1 }, visibleAt(2, 2.2), DEFAULT_LIMITS, search);
   assert.ok(plan.ok && plan.action.kind === "advance" && plan.action.meters === 0.5);
+  const far = planIntent({ kind: "approach_target", meters: 0.1 }, visibleAt(2, 4), DEFAULT_LIMITS, search);
+  assert.ok(far.ok && far.action.kind === "advance" && far.action.meters === 1);
   // Close to the stop distance the safety clamp still wins.
   const near = planIntent({ kind: "approach_target", meters: 1 }, visibleAt(0, 1.4), DEFAULT_LIMITS, search);
   assert.ok(near.ok && near.action.kind === "advance" && Math.abs(near.action.meters - 0.4) < 1e-9);
+});
+
+test("a depth reading that does not match a floor-standing box is an occluder", async () => {
+  const { depthConsistentWithBox } = await import("../policy.js");
+  const cam = { heightM: 0.385, hfovDeg: 110, aspect: 16 / 9 };
+  // Refrigerator ~3.4 m away behind a chair: box bottom at 0.56, depth reads the chair at 0.91 m.
+  assert.equal(depthConsistentWithBox({ x_min: 0.49, y_min: 0.21, x_max: 0.61, y_max: 0.56 }, 0.91, cam), false);
+  // Same box, depth of the refrigerator itself: consistent.
+  assert.equal(depthConsistentWithBox({ x_min: 0.49, y_min: 0.21, x_max: 0.61, y_max: 0.56 }, 3.5, cam), true);
+  // A table 0.34 m away would fill the image bottom: a box ending at 0.56 is something farther.
+  assert.equal(depthConsistentWithBox({ x_min: 0.49, y_min: 0.21, x_max: 0.61, y_max: 0.56 }, 0.34, cam), false);
+  // Wall-mounted TV (box above the horizon) is not judged; a close sofa reaching the image bottom is fine.
+  assert.equal(depthConsistentWithBox({ x_min: 0.4, y_min: 0.1, x_max: 0.6, y_max: 0.4 }, 1.0, cam), true);
+  assert.equal(depthConsistentWithBox({ x_min: 0.1, y_min: 0.3, x_max: 0.9, y_max: 1.0 }, 0.3, cam), true);
+});
+
+test("a visible target with unknown distance is approached in short steps", () => {
+  const blind = obs({ target: { visible: true, source: "vlm", localization: "box", bearing_deg: 0, distance_m: null, height_frac: 0.2 }, front_clearance_m: 5 });
+  assert.equal(maxSafeAdvance(blind, DEFAULT_LIMITS), DEFAULT_LIMITS.unknownTargetAdvanceM);
+});
+
+test("a first sighting off to the side is looked at again, not searched away from", () => {
+  const once = obs({ target: { visible: true, source: "vlm", localization: "box", bearing_deg: -46, distance_m: 2.1, height_frac: 0.1 }, front_clearance_m: 5 });
+  const s = searchWith({ sightingStreak: 1 });
+  const plan = planIntent({ kind: "search" }, once, DEFAULT_LIMITS, s);
+  assert.ok(!plan.ok && plan.reason.includes("face_target"));
+  assert.deepEqual(planIntent({ kind: "face_target" }, once, DEFAULT_LIMITS, s), { ok: true, action: { kind: "rotate", degrees: -46 } });
+  // Seen once straight ahead (e.g. the sofa taken for a bed): searching on stays allowed.
+  const ahead = obs({ target: { visible: true, source: "vlm", localization: "box", bearing_deg: 2, distance_m: 0.44, height_frac: 0.45 }, front_clearance_m: 0.44 });
+  assert.equal(planIntent({ kind: "search" }, ahead, DEFAULT_LIMITS, s).ok, true);
+});
+
+test("far targets are approached in full steps even if the model copies a short one", () => {
+  const plan = planIntent({ kind: "approach_target", meters: 0.5 }, visibleAt(0, 5), DEFAULT_LIMITS, search);
+  assert.ok(plan.ok && plan.action.kind === "advance" && plan.action.meters === 1);
 });

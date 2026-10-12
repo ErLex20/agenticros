@@ -18,10 +18,11 @@
 
 import type OpenAI from "openai";
 import { COCO_CLASSES, resolveCocoClassId } from "@agenticros/object-detection";
-import { Perception, parseJsonObject, type TargetSpec } from "./perception.js";
+import { Perception, parseJsonObject, type PerceptionMode, type TargetSpec } from "./perception.js";
 import {
   FRONTIER_MAX_EXPLORATIONS,
   autopilot,
+  depthConsistentWithBox,
   isGoalReached,
   newSearchState,
   recordAction,
@@ -30,6 +31,7 @@ import {
   planIntent,
   type Action,
   type BBoxNorm,
+  type CameraGeometry,
   type Intent,
   type Observation,
   type Plan,
@@ -52,6 +54,9 @@ const MAX_EXPLICIT_MOVES = 8;
 /** Consecutive failed frontier trips before falling back to walking toward open space. */
 const MAX_FRONTIER_FAILURES = 2;
 
+/** Consecutive observations without a usable vision reply before giving up (vlm mode). */
+const MAX_PERCEPTION_FAILURES = 3;
+
 /** Inner part of a detection box: mostly target pixels, not background or neighbours at the edges. */
 function innerBox(b: BBoxNorm): BBoxNorm {
   const w = b.x_max - b.x_min;
@@ -66,6 +71,9 @@ export interface AgentConfig {
   limits: PolicyLimits;
   /** "llm": Nemotron decides each step; "auto": deterministic policy only (debugging). */
   policy: "llm" | "auto";
+  /** "yolo": local detector for COCO targets plus the vision model; "vlm": vision model only. */
+  perception: PerceptionMode;
+  camera: CameraGeometry;
 }
 
 type GoalMode = "approach" | "describe" | "move" | "stop" | "goto";
@@ -128,11 +136,12 @@ function summarizeObservation(obs: Observation): string {
   const target = !t
     ? "no target"
     : t.visible
-      ? `target visible (${t.source}${t.confidence != null ? ` ${t.confidence}` : ""}) bearing ${t.bearing_deg} deg, ` +
+      ? `target visible (${t.source}${t.localization === "column" ? " column" : ""}${t.confidence != null ? ` ${t.confidence}` : ""}) bearing ${t.bearing_deg} deg, ` +
         `distance ${t.distance_m != null ? `${t.distance_m} m` : "unknown"}, height ${t.height_frac}`
       : "target not visible";
   const doorways = obs.doorway_bearings_deg?.length ? `; doorways at ${obs.doorway_bearings_deg.join(", ")} deg` : "";
-  return `${target}; front clearance ${obs.front_clearance_m != null ? `${obs.front_clearance_m} m` : "unknown"}${doorways}`;
+  const occluded = t?.occluded ? " (occluded: depth reads a closer object)" : "";
+  return `${target}${occluded}; front clearance ${obs.front_clearance_m != null ? `${obs.front_clearance_m} m` : "unknown"}${doorways}`;
 }
 
 const DECISION_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
@@ -220,6 +229,8 @@ const DECISION_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 
 export class GoalAgent {
   private readonly perception: Perception;
+  /** Camera frame of the latest observation (crop checks of vision-model sightings). */
+  private lastImage: Buffer | null = null;
   /** Navigation stack detected at the start of the run. */
   private navigation: NavigationCapabilities = { navigate: false, explore: false };
 
@@ -311,29 +322,32 @@ export class GoalAgent {
     };
   }
 
-  private async observe(step: number, goal: string, target: TargetSpec | null): Promise<Observation> {
+  /** Latest observation, or null when the vision model, the only localizer here, gave no usable reply. */
+  private async observe(step: number, goal: string, target: TargetSpec | null): Promise<Observation | null> {
     const startedAt = performance.now();
     const snapshot = await this.robot.snapshot();
+    this.lastImage = snapshot.image;
     log(`[Timing] AgenticROS snapshot: ${elapsed(startedAt)}s`);
 
     // A failed reading is "unknown" (null), never "clear": the policy then limits advances.
     const clearanceP = this.robot.depth(FRONT_ROI).catch(() => null);
-    // COCO targets are localized by YOLO first; the vision model still reports a coarse column
-    // as a fallback (YOLO misses many rendered objects in simulation), so its failure must not
-    // abort the run.
-    const useYolo = target?.cocoClass != null;
+    // In yolo mode COCO targets are localized by YOLO first; the vision model still localizes
+    // them as a fallback (YOLO misses many rendered objects in simulation), so its failure must
+    // not abort the run. In vlm mode the vision model is the only localizer.
+    const useYolo = this.cfg.perception === "yolo" && target?.cocoClass != null;
     const [scene, candidates] = await Promise.all([
-      useYolo
-        ? this.perception.describe(snapshot.image, goal, target).catch((error: unknown) => ({
-            summary: `Vision model unavailable: ${error instanceof Error ? error.message : String(error)}`,
-            target: null,
-            doorwayBearingsDeg: [],
-          }))
-        : this.perception.describe(snapshot.image, goal, target),
+      this.perception.describe(snapshot.image, goal, target).catch((error: unknown) => {
+        log(`[Perception] vision model failed: ${error instanceof Error ? error.message : String(error)}`);
+        return null;
+      }),
       useYolo && target ? this.perception.detectCoco(snapshot.image, target) : Promise.resolve([]),
     ]);
+    // Without YOLO the vision model is the only localizer: no reply means no observation,
+    // never "target not visible" (that would count as searched space).
+    if (!scene && !useYolo) return null;
+    const sceneSummary = scene?.summary ?? "Vision model unavailable.";
 
-    let observed: TargetObservation | null = useYolo ? { visible: false, source: "yolo" } : scene.target;
+    let observed: TargetObservation | null = useYolo ? { visible: false, source: "yolo" } : (scene?.target ?? null);
     if (useYolo && target) {
       // Highest confidence first; skip instances that fail the vision-model check
       // (requested attributes, or the class itself for low-confidence detections).
@@ -347,16 +361,22 @@ export class GoalAgent {
           break;
         }
       }
-      if (!observed?.visible && scene.target?.visible) {
-        log(`[Perception] YOLO missed "${target.description}"; using the vision-model column`);
+      if (!observed?.visible && scene?.target?.visible) {
+        log(`[Perception] YOLO missed "${target.description}"; using the vision-model sighting`);
         observed = scene.target;
       }
     }
     if (observed?.visible && observed.bbox) {
+      // A tight box (detector or grounding model): sample its inner part; a column band as is.
       const distance = await this.robot
-        .depth(observed.source === "yolo" ? innerBox(observed.bbox) : observed.bbox)
+        .depth(observed.localization === "column" ? observed.bbox : innerBox(observed.bbox))
         .catch(() => null);
       observed.distance_m = distance != null ? round(distance) : null;
+      if (distance != null && observed.localization !== "column" && !depthConsistentWithBox(observed.bbox, distance, this.cfg.camera)) {
+        log(`[Perception] depth ${round(distance)} m does not match the target box (occluded by a closer object): distance unknown`);
+        observed.occluded = true;
+        observed.distance_m = null;
+      }
     }
     const clearance = await clearanceP;
     log(`[Timing] Perception: ${elapsed(startedAt)}s`);
@@ -364,8 +384,8 @@ export class GoalAgent {
       step,
       target: observed,
       front_clearance_m: clearance != null ? round(clearance) : null,
-      scene: scene.summary,
-      doorway_bearings_deg: scene.doorwayBearingsDeg,
+      scene: sceneSummary,
+      doorway_bearings_deg: scene?.doorwayBearingsDeg ?? [],
     };
   }
 
@@ -460,6 +480,7 @@ export class GoalAgent {
     const search: SearchState = newSearchState(parsed.searchDirection);
     const history: HistoryEntry[] = [];
     let frontierFailures = 0;
+    let perceptionFailures = 0;
     const startedAt = performance.now();
 
     for (let step = 1; step <= this.cfg.maxSteps; step++) {
@@ -467,6 +488,17 @@ export class GoalAgent {
         return `Tempo massimo (${this.cfg.maxSeconds} s) esaurito prima di raggiungere l'obiettivo.`;
       }
       const obs = await this.observe(step, goal, parsed.target);
+      if (!obs) {
+        // No motion on a missing observation: look again, give up after a few failures.
+        perceptionFailures += 1;
+        log(`[Step ${step}] no observation (vision model failure ${perceptionFailures}/${MAX_PERCEPTION_FAILURES})`);
+        if (perceptionFailures >= MAX_PERCEPTION_FAILURES) {
+          return "Modello di visione non disponibile: il robot è fermo e il compito è interrotto.";
+        }
+        continue;
+      }
+      perceptionFailures = 0;
+      await this.checkVisionSighting(obs, parsed.target, search, limits);
       log(`[Step ${step}] ${summarizeObservation(obs)}`);
       log(`[Scene] ${obs.scene}`);
       recordObservation(search, obs, limits);
@@ -539,6 +571,24 @@ export class GoalAgent {
       });
     }
     return `Numero massimo di passi (${this.cfg.maxSteps}) raggiunto senza completare l'obiettivo.`;
+  }
+
+  /**
+   * Vision-model sightings are checked once more on a zoomed crop when they would become
+   * confirmed (second frame in a row) and when they would count as arrival. The full-frame
+   * pass mistakes similar objects consistently (a closed folding door for a wardrobe); the
+   * crop question rejected that case 3 of 3 times. A rejected sighting counts as not visible.
+   */
+  private async checkVisionSighting(obs: Observation, target: TargetSpec | null, search: SearchState, limits: PolicyLimits): Promise<void> {
+    const t = obs.target;
+    if (!t?.visible || t.source !== "vlm" || !target || !this.lastImage) return;
+    const confirming = search.sightingStreak + 1 === 2;
+    if (!confirming && !isGoalReached(obs, limits)) return;
+    const match = await this.perception.verifyCandidate(this.lastImage, t, target, 1, true).catch((error: unknown) => {
+      log(`[Verify] failed, sighting kept: ${error instanceof Error ? error.message : String(error)}`);
+      return true;
+    });
+    if (!match) obs.target = { visible: false, source: "vlm", localization: t.localization ?? "box" };
   }
 
   private async describeScene(goal: string): Promise<string> {

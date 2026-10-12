@@ -15,6 +15,12 @@ export interface BBoxNorm {
 export interface TargetObservation {
   visible: boolean;
   source: "yolo" | "vlm";
+  /**
+   * "box": the bbox tightly bounds the target (detector, or a vision model that grounds).
+   * "column": the bbox is a coarse image column band from the vision model, which may also
+   * contain nearer objects. Missing means "box".
+   */
+  localization?: "box" | "column";
   confidence?: number;
   /** Horizontal angle to the target centre in degrees; positive = left of the optical axis. */
   bearing_deg?: number;
@@ -22,6 +28,11 @@ export interface TargetObservation {
   /** Target bbox height as a fraction of the image height. */
   height_frac?: number;
   distance_m?: number | null;
+  /**
+   * Set when the depth in the box is not the target's: a closer object hides it (the
+   * reading does not match the box geometry, see depthConsistentWithBox). distance_m is null then.
+   */
+  occluded?: boolean;
 }
 
 export interface Observation {
@@ -63,6 +74,11 @@ export interface PolicyLimits {
   maxAdvanceM: number;
   /** Longest advance when front clearance could not be measured (fail safe, not fail open). */
   unknownClearanceAdvanceM: number;
+  /**
+   * Longest advance toward a visible target whose distance is unknown (depth failed, or it
+   * read a closer object): the front corridor does not see obstacles lower than the camera.
+   */
+  unknownTargetAdvanceM: number;
   /** Bbox height fraction treated as "close" when no depth is available. */
   closeHeightFrac: number;
   /** Bearing above which the target must be centred before advancing. */
@@ -94,6 +110,7 @@ export const DEFAULT_LIMITS: PolicyLimits = {
   safetyMarginM: 0.45,
   maxAdvanceM: 1.5,
   unknownClearanceAdvanceM: 0.3,
+  unknownTargetAdvanceM: 0.5,
   closeHeightFrac: 0.45,
   alignToleranceDeg: 12,
   arriveBearingDeg: 30,
@@ -212,6 +229,36 @@ export function chooseExploreHeading(search: SearchState, limits: PolicyLimits):
   return best ? best.heading : null;
 }
 
+/** Camera mounting used to tell where a floor-standing object meets the floor in the image. */
+export interface CameraGeometry {
+  heightM: number;
+  hfovDeg: number;
+  /** Image width / height. */
+  aspect: number;
+}
+
+/** Normalized image y where the floor is seen at the given planar depth (level camera). */
+export function floorImageY(depthM: number, cam: CameraGeometry): number {
+  const tanHalfV = Math.tan((cam.hfovDeg * Math.PI) / 360) / cam.aspect;
+  return 0.5 + (0.5 * (cam.heightM / depthM)) / tanHalfV;
+}
+
+/** Box bottom this far above the expected floor contact means the depth hit something in front. */
+const FLOOR_CONTACT_MARGIN = 0.08;
+
+/**
+ * False when a depth reading inside a target box cannot be the target's: the box
+ * bottom is below the horizon (a floor-standing object) yet well above the image row
+ * where the floor lies at that depth (or the image bottom, when that row is below the
+ * frame), so a closer object produced the reading, e.g. a chair in front of a
+ * refrigerator. Boxes ending above the horizon (wall-mounted, on a table) are not judged.
+ * In simulation: 17 of 20 such readings within 1.5 m caught, no false alarm in 88.
+ */
+export function depthConsistentWithBox(box: BBoxNorm, depthM: number, cam: CameraGeometry): boolean {
+  if (box.y_max <= 0.52) return true;
+  return box.y_max >= Math.min(1, floorImageY(depthM, cam)) - FLOOR_CONTACT_MARGIN;
+}
+
 /** Bearing (deg, positive = left) of a normalized image x for a pinhole camera. */
 export function bearingFromImageX(xNorm: number, hfovDeg: number): number {
   const halfTan = Math.tan((hfovDeg * Math.PI) / 360);
@@ -234,7 +281,7 @@ export function isGoalReached(obs: Observation, limits: PolicyLimits): boolean {
     const near = t.distance_m <= limits.stopDistanceM + limits.arriveToleranceM;
     // A vision-model column band can contain nearer objects than the target:
     // also require the target to look reasonably large.
-    return t.source === "vlm" ? near && (t.height_frac ?? 0) >= 0.25 : near;
+    return t.localization === "column" ? near && (t.height_frac ?? 0) >= 0.25 : near;
   }
   return (t.height_frac ?? 0) >= limits.closeHeightFrac;
 }
@@ -243,8 +290,8 @@ export function isGoalReached(obs: Observation, limits: PolicyLimits): boolean {
 export function maxSafeAdvance(obs: Observation, limits: PolicyLimits): number {
   let max = limits.maxAdvanceM;
   const t = obs.target;
-  if (t?.visible && typeof t.distance_m === "number") {
-    max = Math.min(max, t.distance_m - limits.stopDistanceM);
+  if (t?.visible) {
+    max = Math.min(max, typeof t.distance_m === "number" ? t.distance_m - limits.stopDistanceM : limits.unknownTargetAdvanceM);
   }
   max = Math.min(
     max,
@@ -276,6 +323,12 @@ export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimit
     case "search": {
       if (confirmed) {
         return { ok: false, reason: `the target is already visible at ${round(bearing, 0)} deg; use face_target or approach_target` };
+      }
+      // A first, unconfirmed sighting off to the side: turning toward it gives the second look
+      // that confirms or rejects it. Searching away (as the model did in simulation, using
+      // search(right) to "turn toward" a target at -46 deg) loses it and costs two steps.
+      if (t && search.sightingStreak === 1 && Math.abs(bearing) > limits.alignToleranceDeg) {
+        return { ok: false, reason: `the target may be at ${round(bearing, 0)} deg (seen once); use face_target to look at it again` };
       }
       if (search.exploreHeadingDeg != null) {
         return { ok: false, reason: "an exploration move is in progress; use explore" };
@@ -351,10 +404,19 @@ export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimit
       if (isGoalReached(obs, limits)) return { ok: false, reason: "the target is already within the stop distance; finish" };
       const allowed = maxSafeAdvance(obs, limits);
       if (allowed < 0.1) return { ok: false, reason: `no room to advance safely (allowed ${round(allowed)} m)` };
-      // The model's step is a cap, floored at 0.5 m: copying a tiny value from the history
-      // (approach_target(0.1 m)) crawled 10 cm per observation. Safety limits still apply.
-      const requested = intent.meters != null && Number.isFinite(intent.meters) ? Math.max(0.5, intent.meters) : 1.0;
-      return { ok: true, action: { kind: "advance", meters: Math.min(requested, allowed) } };
+      // The model's step is a cap, floored at 0.5 m (1 m while the target is far): copying a
+      // small value from the history (approach_target(0.1 m), or a 0.5 m step clamped earlier)
+      // crawled toward the target. Safety limits still apply.
+      const far = typeof t.distance_m === "number" && t.distance_m - limits.stopDistanceM >= 1.5;
+      const floor = far ? 1.0 : 0.5;
+      const requested = intent.meters != null && Number.isFinite(intent.meters) ? Math.max(floor, intent.meters) : 1.0;
+      const meters = Math.min(requested, allowed);
+      const unknown = typeof t.distance_m !== "number" && meters >= limits.unknownTargetAdvanceM - 1e-9 && requested > meters;
+      return {
+        ok: true,
+        action: { kind: "advance", meters },
+        ...(unknown ? { note: `advance limited to ${round(meters)} m: target distance unknown` } : {}),
+      };
     }
     case "rotate": {
       if (!Number.isFinite(intent.degrees) || Math.abs(intent.degrees) < 3) {
