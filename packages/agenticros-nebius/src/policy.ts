@@ -114,9 +114,13 @@ export const DEFAULT_LIMITS: PolicyLimits = {
   closeHeightFrac: 0.45,
   alignToleranceDeg: 12,
   arriveBearingDeg: 30,
-  searchStepDeg: 45,
+  // The camera sees ~110 deg and the vision model finds targets at the image edges as well as
+  // in the centre (87% at 45-55 deg off-axis in simulation): quarter turns cover every direction
+  // within 45 deg of some view, and a full search turn takes 5 rotations instead of 9.
+  searchStepDeg: 90,
   exploreStepM: 2.5,
-  maxExplorations: 4,
+  // Sized with the 90 deg search step: ~10 steps per spot fit 7 spots in the 80-step budget.
+  maxExplorations: 7,
   exploreMinClearanceM: 1.5,
   // The house's white sofa reaches 0.65 as "bed": below 0.8, check and confirm.
   strongConfidence: 0.8,
@@ -158,7 +162,21 @@ export interface SearchState {
   blockedHeadingsDeg: number[];
   /** Consecutive observations with the target visible. */
   sightingStreak: number;
+  /** Absolute heading of the latest unconfirmed sighting, to tell whether it vanishes once faced. */
+  pendingSightingDeg: number | null;
+  /**
+   * Headings from the current spot where an unconfirmed sighting vanished when the robot
+   * turned to it. Seen twice at the same heading it is a phantom: in simulation a sofa
+   * passed for a bed only near the image edge, and the robot turned to it and back for
+   * 20 steps.
+   */
+  vanishedDeg: { headingDeg: number; count: number }[];
 }
+
+/** A sighting within this angle of a recorded heading is the same object. */
+const PHANTOM_MATCH_DEG = 20;
+/** Vanishings at one heading after which sightings there are ignored from this spot. */
+const PHANTOM_VANISHINGS = 2;
 
 export function newSearchState(direction: 1 | -1): SearchState {
   return {
@@ -173,7 +191,22 @@ export function newSearchState(direction: 1 | -1): SearchState {
     lastExploreHeadingDeg: null,
     blockedHeadingsDeg: [],
     sightingStreak: 0,
+    pendingSightingDeg: null,
+    vanishedDeg: [],
   };
+}
+
+/**
+ * True when a new (not yet confirmed) sighting lies where unconfirmed sightings already
+ * vanished twice when faced from this spot; the caller then treats the target as not visible.
+ */
+export function isPhantomSighting(obs: Observation, search: SearchState, limits: PolicyLimits): boolean {
+  const t = obs.target;
+  if (!t?.visible || search.sightingStreak > 0 || sightingConfirmed(obs, search, limits)) return false;
+  const heading = wrapDeg(search.headingDeg + (t.bearing_deg ?? 0));
+  return search.vanishedDeg.some(
+    (v) => v.count >= PHANTOM_VANISHINGS && Math.abs(wrapDeg(heading - v.headingDeg)) <= PHANTOM_MATCH_DEG,
+  );
 }
 
 /** Angle wrapped to (-180, 180]. */
@@ -511,7 +544,16 @@ export function autopilot(obs: Observation, limits: PolicyLimits, search: Search
 /** Update the search state with a new observation, before deciding. */
 export function recordObservation(search: SearchState, obs: Observation, limits: PolicyLimits): void {
   const t = obs.target;
+  const pending = search.pendingSightingDeg;
+  if (pending != null && !t?.visible && Math.abs(wrapDeg(search.headingDeg - pending)) <= PHANTOM_MATCH_DEG) {
+    // The robot turned to an unconfirmed sighting and it was gone (or failed the crop check).
+    const v = search.vanishedDeg.find((x) => Math.abs(wrapDeg(x.headingDeg - pending)) <= PHANTOM_MATCH_DEG);
+    if (v) v.count += 1;
+    else search.vanishedDeg.push({ headingDeg: pending, count: 1 });
+  }
   search.sightingStreak = t?.visible ? search.sightingStreak + 1 : 0;
+  search.pendingSightingDeg =
+    t?.visible && !sightingConfirmed(obs, search, limits) ? round(wrapDeg(search.headingDeg + (t.bearing_deg ?? 0)), 1) : null;
   // Weak sightings (vision model, low-confidence YOLO) are often similar objects, e.g. a
   // sofa for a bed. They count only once repeated, e.g. after turning toward them; until
   // then the search turn and any exploration move are kept, so a false alarm costs one step.
@@ -580,5 +622,7 @@ function endExploration(search: SearchState, searchedDeg: number): void {
   search.scan = [];
   search.doorwayFrames = [];
   search.blockedHeadingsDeg = [];
+  search.vanishedDeg = [];
+  search.pendingSightingDeg = null;
   search.searchedDeg = searchedDeg;
 }

@@ -20,10 +20,12 @@ import type OpenAI from "openai";
 import { COCO_CLASSES, resolveCocoClassId } from "@agenticros/object-detection";
 import { Perception, parseJsonObject, type PerceptionMode, type TargetSpec } from "./perception.js";
 import {
+  DEFAULT_LIMITS,
   FRONTIER_MAX_EXPLORATIONS,
   autopilot,
   depthConsistentWithBox,
   isGoalReached,
+  isPhantomSighting,
   newSearchState,
   recordAction,
   recordObservation,
@@ -149,7 +151,7 @@ const DECISION_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "search",
-      description: "The target is not visible: turn about 45 degrees to look elsewhere. Direction defaults to the side where the target was last seen.",
+      description: `The target is not visible: turn about ${DEFAULT_LIMITS.searchStepDeg} degrees to look elsewhere. Direction defaults to the side where the target was last seen.`,
       parameters: {
         type: "object",
         properties: { direction: { type: "string", enum: ["left", "right"] } },
@@ -498,6 +500,10 @@ export class GoalAgent {
         continue;
       }
       perceptionFailures = 0;
+      if (obs.target?.visible && isPhantomSighting(obs, search, limits)) {
+        log(`[Perception] ignoring the sighting at ${obs.target.bearing_deg} deg: it vanished twice when faced from here`);
+        obs.target = { visible: false, source: obs.target.source, localization: obs.target.localization ?? "box" };
+      }
       await this.checkVisionSighting(obs, parsed.target, search, limits);
       log(`[Step ${step}] ${summarizeObservation(obs)}`);
       log(`[Scene] ${obs.scene}`);
