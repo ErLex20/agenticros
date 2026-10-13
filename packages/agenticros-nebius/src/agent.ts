@@ -2,7 +2,9 @@
  * Observe → decide → act loop that runs until the goal is reached or a bound
  * (steps, time, exploration budget) is hit. Without a map, a target that is not
  * seen during a full search turn is looked for from a new spot: the robot walks
- * toward the most open direction measured during the turn and searches again.
+ * toward confirmed doorways or the most open direction measured during the turn
+ * (with NEBIUS_EXPLORE_CHOICE=vision, the way the vision model picks from the
+ * views of the turn) and searches again.
  *
  * With Nav2 running on a known map, named places (rooms) come from
  * ros2_list_places: "go to the bedroom" navigates there, and an object that
@@ -18,12 +20,15 @@
 
 import type OpenAI from "openai";
 import { COCO_CLASSES, resolveCocoClassId } from "@agenticros/object-detection";
-import { Perception, parseJsonObject, type PerceptionMode, type TargetSpec } from "./perception.js";
+import { Perception, parseJsonObject, type PerceptionMode, type TargetSpec, type TurnView } from "./perception.js";
 import {
   DEFAULT_LIMITS,
   FRONTIER_MAX_EXPLORATIONS,
   autopilot,
+  bearingFromImageX,
   depthConsistentWithBox,
+  enterPlace,
+  fullTurnSearched,
   isGoalReached,
   isPhantomSighting,
   newSearchState,
@@ -31,6 +36,7 @@ import {
   recordObservation,
   round,
   planIntent,
+  wrapDeg,
   type Action,
   type BBoxNorm,
   type CameraGeometry,
@@ -56,8 +62,13 @@ const MAX_EXPLICIT_MOVES = 8;
 /** Consecutive failed frontier trips before falling back to walking toward open space. */
 const MAX_FRONTIER_FAILURES = 2;
 
-/** Consecutive observations without a usable vision reply before giving up (vlm mode). */
+/** Consecutive observations without a camera frame or a usable vision reply before giving up. */
 const MAX_PERCEPTION_FAILURES = 3;
+
+/** Views of a search turn closer than this in heading are the same view; the latest one is kept. */
+const SAME_VIEW_DEG = 30;
+/** A view within this angle of an explored heading is shown as explored. */
+const EXPLORED_VIEW_DEG = 45;
 
 /** Inner part of a detection box: mostly target pixels, not background or neighbours at the edges. */
 function innerBox(b: BBoxNorm): BBoxNorm {
@@ -76,6 +87,12 @@ export interface AgentConfig {
   /** "vlm" (default): vision model only; "yolo": local detector for COCO targets plus the vision model. */
   perception: PerceptionMode;
   camera: CameraGeometry;
+  /**
+   * Where to explore after a full turn without the target (no Nav2 frontiers): "vision" asks
+   * the vision model with all the views of the turn; "open" uses confirmed doorways, then the
+   * most open direction.
+   */
+  exploreChoice: "vision" | "open";
 }
 
 type GoalMode = "approach" | "describe" | "move" | "stop" | "goto";
@@ -165,8 +182,8 @@ const DECISION_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       description:
         "Only after a full search turn (searched_deg >= 360) without seeing the target: look from another spot. The " +
         "controller drives with Nav2 to the nearest unexplored frontier of the live map, or without a map walks a couple " +
-        "of meters toward the most open direction measured during the turn (never straight back). Then search again " +
-        "from there. Use it to reach other rooms. While exploring is true, keep calling explore.",
+        "of meters toward a direction chosen from the search turn (never straight back). Then search again from there. " +
+        "Use it to reach other rooms. While exploring is true, keep calling explore.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -174,7 +191,9 @@ const DECISION_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "face_target",
-      description: "Turn in place so the visible target is centred in the camera. The controller computes the angle.",
+      description:
+        "Turn in place so the visible target is centred in the camera, when it is more than 12 degrees off-centre " +
+        "(closer to the centre, use approach_target). The controller computes the angle.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -233,6 +252,10 @@ export class GoalAgent {
   private readonly perception: Perception;
   /** Camera frame of the latest observation (crop checks of vision-model sightings). */
   private lastImage: Buffer | null = null;
+  /** Frames of the current search turn with their dead-reckoned headings, for the exploration choice. */
+  private turnViews: { turnId: number; views: { headingDeg: number; image: Buffer }[] } = { turnId: -1, views: [] };
+  /** Turn for which the vision model was already asked where to explore. */
+  private askedTurnId = -1;
   /** Navigation stack detected at the start of the run. */
   private navigation: NavigationCapabilities = { navigate: false, explore: false };
 
@@ -327,7 +350,13 @@ export class GoalAgent {
   /** Latest observation, or null when the vision model, the only localizer here, gave no usable reply. */
   private async observe(step: number, goal: string, target: TargetSpec | null): Promise<Observation | null> {
     const startedAt = performance.now();
-    const snapshot = await this.robot.snapshot();
+    // A camera timeout is a missed observation, not the end of the task (it ended a 57-step
+    // run in simulation): no motion this step, and the loop gives up after a few in a row.
+    const snapshot = await this.robot.snapshot().catch((error: unknown) => {
+      log(`[Perception] camera snapshot failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    });
+    if (!snapshot) return null;
     this.lastImage = snapshot.image;
     log(`[Timing] AgenticROS snapshot: ${elapsed(startedAt)}s`);
 
@@ -493,9 +522,9 @@ export class GoalAgent {
       if (!obs) {
         // No motion on a missing observation: look again, give up after a few failures.
         perceptionFailures += 1;
-        log(`[Step ${step}] no observation (vision model failure ${perceptionFailures}/${MAX_PERCEPTION_FAILURES})`);
+        log(`[Step ${step}] no observation (camera or vision model failure ${perceptionFailures}/${MAX_PERCEPTION_FAILURES})`);
         if (perceptionFailures >= MAX_PERCEPTION_FAILURES) {
-          return "Modello di visione non disponibile: il robot è fermo e il compito è interrotto.";
+          return "Camera o modello di visione non disponibili: il robot è fermo e il compito è interrotto.";
         }
         continue;
       }
@@ -508,6 +537,7 @@ export class GoalAgent {
       log(`[Step ${step}] ${summarizeObservation(obs)}`);
       log(`[Scene] ${obs.scene}`);
       recordObservation(search, obs, limits);
+      await this.suggestExploration(obs, parsed.target, search, limits);
 
       let proposed: Intent | null = null;
       if (this.cfg.policy === "llm") {
@@ -577,6 +607,55 @@ export class GoalAgent {
       });
     }
     return `Numero massimo di passi (${this.cfg.maxSteps}) raggiunto senza completare l'obiettivo.`;
+  }
+
+  /**
+   * Topological exploration without a map. Each place where the robot searches a full turn is
+   * a node; the headings walked from it (and the way it came from) are its explored edges.
+   * When a turn ends without the target, the vision model sees all the views of the turn and
+   * picks the way to go; the controller then turns and walks that way as for any exploration.
+   */
+  private async suggestExploration(obs: Observation, target: TargetSpec | null, search: SearchState, limits: PolicyLimits): Promise<void> {
+    if (this.cfg.exploreChoice !== "vision" || !target || limits.frontierExploration || !this.lastImage) return;
+    if (search.exploreHeadingDeg != null) return; // walking: not a view of the turn
+    if (this.turnViews.turnId !== search.turnId) this.turnViews = { turnId: search.turnId, views: [] };
+    this.turnViews.views.push({ headingDeg: search.headingDeg, image: this.lastImage });
+    if (obs.target?.visible || !fullTurnSearched(search, limits) || this.askedTurnId === search.turnId) return;
+    if (search.explorations >= limits.maxExplorations) return;
+    this.askedTurnId = search.turnId;
+
+    const place = enterPlace(search);
+    const views: { headingDeg: number; image: Buffer }[] = [];
+    for (const v of [...this.turnViews.views].reverse()) {
+      if (!views.some((u) => Math.abs(wrapDeg(u.headingDeg - v.headingDeg)) < SAME_VIEW_DEG)) views.push(v);
+    }
+    views.sort((a, b) => wrapDeg(b.headingDeg - search.headingDeg) - wrapDeg(a.headingDeg - search.headingDeg));
+    const tiles: TurnView[] = views.map((v) => ({
+      image: v.image,
+      relativeDeg: wrapDeg(v.headingDeg - search.headingDeg),
+      explored: place.exploredDeg.some((e) => Math.abs(wrapDeg(v.headingDeg - e)) <= EXPLORED_VIEW_DEG),
+    }));
+    log(
+      `[Graph] place ${(search.placeIndex ?? 0) + 1} of ${search.places.length} at (${round(place.x, 1)}, ${round(place.y, 1)}) m, ` +
+        `explored headings [${place.exploredDeg.map((h) => round(h, 0)).join(", ")}] deg`,
+    );
+    const startedAt = performance.now();
+    const choice = await this.perception.chooseExploreView(tiles, target).catch((error: unknown) => {
+      log(`[Explore] vision model failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    });
+    log(`[Timing] Explore choice: ${elapsed(startedAt)}s`);
+    if (!choice) {
+      log("[Explore] no usable choice from the vision model: confirmed doorways, then the most open direction");
+      return;
+    }
+    const view = views[choice.view]!;
+    const heading = round(wrapDeg(view.headingDeg + bearingFromImageX(choice.x, this.cfg.camera.hfovDeg)), 1);
+    search.suggestedHeadingDeg = heading;
+    log(
+      `[Explore] vision model: view ${choice.view} (${round(tiles[choice.view]!.relativeDeg, 0)} deg${tiles[choice.view]!.explored ? ", explored" : ""}), ` +
+        `x ${round(choice.x)} -> heading ${round(heading, 0)} deg (robot ${round(search.headingDeg, 0)} deg): ${choice.reason}`,
+    );
   }
 
   /**

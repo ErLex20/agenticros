@@ -136,6 +136,14 @@ export interface ScanSample {
   clearance_m: number;
 }
 
+/** A way around an obstacle between the robot and a visible target (see SearchState.detour). */
+export interface Detour {
+  headingDeg: number;
+  remainingM: number;
+  side: 1 | -1;
+  reason: "stuck" | "blocked";
+}
+
 export interface SearchState {
   /** Cumulative rotation performed while the target was not visible. */
   searchedDeg: number;
@@ -162,6 +170,31 @@ export interface SearchState {
   blockedHeadingsDeg: number[];
   /** Consecutive observations with the target visible. */
   sightingStreak: number;
+  /**
+   * The current sighting streak began already within arrival distance with the box filling the
+   * frame: from that close only a fragment shows, and in simulation the vision model and its crop
+   * check both took a sofa 0.37 m ahead for a bed. Such a streak is never confirmed by repetition.
+   */
+  closeFirstSighting: boolean;
+  /** Latest sighting farther than the arrival distance: absolute heading and observations since. */
+  farSighting: { headingDeg: number; age: number } | null;
+  /** Last executed motion, with the target as seen just before it: did the motion happen? */
+  lastMotion: { kind: "rotate" | "advance"; amount: number; bearingDeg: number; distanceM: number | null } | null;
+  /**
+   * Consecutive motions after which a visible target stayed where it was: the body is blocked.
+   * In simulation the robot pressed against the edge of a glass folding door for 45 steps,
+   * turning and walking toward the bed with no effect while the depth saw free space past it.
+   */
+  ineffectiveMotions: number;
+  /**
+   * Way around an obstacle between the robot and a confirmed target: heading to walk along,
+   * distance left, side of the turn (+1 left) and why ("stuck": motions without effect;
+   * "blocked": no room to advance toward the target).
+   */
+  detour: Detour | null;
+  /** Detours started from this spot, and the side of the latest one. */
+  detours: number;
+  lastDetourSide: 1 | -1 | null;
   /** Absolute heading of the latest unconfirmed sighting, to tell whether it vanishes once faced. */
   pendingSightingDeg: number | null;
   /**
@@ -171,10 +204,59 @@ export interface SearchState {
    * 20 steps.
    */
   vanishedDeg: { headingDeg: number; count: number }[];
+  /**
+   * Dead-reckoned position (m) in the frame of the start pose (x forward, y left), from the
+   * executed advances along headingDeg. No ground truth and no odometry: it drifts, which a
+   * graph of places tolerates (it only tells whether the robot is back at a known place).
+   */
+  xM: number;
+  yM: number;
+  /** Places where the robot searched a full turn: the nodes of the topological graph. */
+  places: PlaceNode[];
+  /** Index in places of the place of the current search turn; null before the first one. */
+  placeIndex: number | null;
+  /** Incremented whenever a new search turn starts (new spot, or the target was seen and lost). */
+  turnId: number;
+  /**
+   * Heading chosen by the vision model for the next exploration from this turn (see
+   * chooseExploreHeading); null when not asked yet or not usable.
+   */
+  suggestedHeadingDeg: number | null;
 }
+
+/**
+ * A place of the topological graph built while exploring without a map: where the robot
+ * searched a full turn, and the directions already walked from it (the edges taken).
+ */
+export interface PlaceNode {
+  x: number;
+  y: number;
+  /** Headings walked from here, plus the reverse of the walk that led here. */
+  exploredDeg: number[];
+}
+
+/** A search turn closer than this to a known place is at that place. */
+export const PLACE_MATCH_M = 1.5;
 
 /** A sighting within this angle of a recorded heading is the same object. */
 const PHANTOM_MATCH_DEG = 20;
+/** Box height (fraction of the image) above which a close target fills the frame. */
+const CLOSE_FILL_FRAC = 0.6;
+/** A close first sighting is the end of an approach if the target was seen farther away this recently... */
+const FAR_SIGHTING_MAX_AGE = 3;
+/** ...within this angle. */
+const FAR_SIGHTING_MATCH_DEG = 25;
+/** A turn of at least this much must move a visible target in the image... */
+const STUCK_MIN_TURN_DEG = 8;
+/** ...by at least this fraction of the turn, or the turn did not happen. */
+const STUCK_TURN_FRACTION = 0.35;
+/** Motions without effect in a row after which the robot goes around the obstacle. */
+const STUCK_MOTIONS = 2;
+/** Way around: turn this far, then walk this much (front clearance permitting). */
+const DETOUR_TURN_DEG = 40;
+const DETOUR_WALK_M = 0.7;
+/** Detours from one spot before a blocked path ends the approach. */
+const MAX_DETOURS = 3;
 /** Vanishings at one heading after which sightings there are ignored from this spot. */
 const PHANTOM_VANISHINGS = 2;
 
@@ -191,9 +273,38 @@ export function newSearchState(direction: 1 | -1): SearchState {
     lastExploreHeadingDeg: null,
     blockedHeadingsDeg: [],
     sightingStreak: 0,
+    closeFirstSighting: false,
+    farSighting: null,
+    lastMotion: null,
+    ineffectiveMotions: 0,
+    detour: null,
+    detours: 0,
+    lastDetourSide: null,
     pendingSightingDeg: null,
     vanishedDeg: [],
+    xM: 0,
+    yM: 0,
+    places: [],
+    placeIndex: null,
+    turnId: 0,
+    suggestedHeadingDeg: null,
   };
+}
+
+/**
+ * The place of the current search turn: the known place within PLACE_MATCH_M of the
+ * dead-reckoned position, or a new one. A new place remembers the reverse of the walk that
+ * led to it, so the way back counts as explored.
+ */
+export function enterPlace(search: SearchState): PlaceNode {
+  let index = search.places.findIndex((p) => Math.hypot(p.x - search.xM, p.y - search.yM) <= PLACE_MATCH_M);
+  if (index < 0) {
+    const back = search.lastExploreHeadingDeg != null ? [round(wrapDeg(search.lastExploreHeadingDeg + 180), 1)] : [];
+    search.places.push({ x: round(search.xM), y: round(search.yM), exploredDeg: back });
+    index = search.places.length - 1;
+  }
+  search.placeIndex = index;
+  return search.places[index]!;
 }
 
 /**
@@ -245,6 +356,11 @@ export function confirmedDoorways(search: SearchState): { heading: number; votes
  * clearance measured when facing the chosen heading.
  */
 export function chooseExploreHeading(search: SearchState, limits: PolicyLimits): number | null {
+  const isBlocked = (heading: number) =>
+    search.blockedHeadingsDeg.some((h) => Math.abs(wrapDeg(heading - h)) < limits.searchStepDeg / 2);
+  // The vision model's choice over the whole turn comes first: in simulation it moved the
+  // robot toward the target's room in 58% of the decisions, the most open direction in 38%.
+  if (search.suggestedHeadingDeg != null && !isBlocked(search.suggestedHeadingDeg)) return search.suggestedHeadingDeg;
   const back = search.lastExploreHeadingDeg != null ? wrapDeg(search.lastExploreHeadingDeg + 180) : null;
   const candidates: { heading: number; score: number }[] = [
     ...confirmedDoorways(search).map((d) => ({ heading: d.heading, score: 5 + d.votes })),
@@ -254,7 +370,7 @@ export function chooseExploreHeading(search: SearchState, limits: PolicyLimits):
   ];
   let best: { heading: number; score: number } | null = null;
   for (const candidate of candidates) {
-    if (search.blockedHeadingsDeg.some((h) => Math.abs(wrapDeg(candidate.heading - h)) < limits.searchStepDeg / 2)) continue;
+    if (isBlocked(candidate.heading)) continue;
     let score = candidate.score;
     if (back != null && Math.abs(wrapDeg(candidate.heading - back)) <= 60) score -= 4;
     if (!best || score > best.score) best = { heading: candidate.heading, score };
@@ -343,6 +459,11 @@ export type Plan =
        * blocked, or a Nav2 trip to a frontier of the live map.
        */
       explore?: { phase: "turn" | "walk" | "blocked" | "frontier"; headingDeg: number };
+      /**
+       * Set for the moves going around an obstacle between the robot and the target (see
+       * SearchState.detour); "flip" turns to the other side when this one has no room.
+       */
+      detour?: "turn" | "walk" | "flip";
     }
   | { ok: false; reason: string };
 
@@ -350,6 +471,14 @@ export type Plan =
 export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimits, search: SearchState): Plan {
   const t = obs.target?.visible ? obs.target : null;
   const bearing = t?.bearing_deg ?? 0;
+  if (search.detour && intent.kind === "finish" && !intent.success && planDetour(search.detour, obs, search, limits)) {
+    return { ok: false, reason: "going around the obstacle first (detour in progress)" };
+  }
+  if (search.detour && intent.kind !== "finish") {
+    // No room to go around this way: plan the intent as usual (recordAction drops the detour).
+    const way = planDetour(search.detour, obs, search, limits);
+    if (way) return way;
+  }
   // Searching on is allowed while a sighting is unconfirmed: it may be a similar object.
   const confirmed = t != null && sightingConfirmed(obs, search, limits);
   switch (intent.kind) {
@@ -402,7 +531,7 @@ export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimit
         return {
           ok: true,
           action: { kind: "rotate", degrees: delta },
-          note: "turning toward the most open direction",
+          note: "turning toward the exploration heading",
           explore: { phase: "turn", headingDeg: heading },
         };
       }
@@ -420,13 +549,18 @@ export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimit
       return {
         ok: true,
         action: { kind: "advance", meters },
-        note: "exploring toward the most open direction",
+        note: "walking toward the exploration heading",
         explore: { phase: "walk", headingDeg: heading },
       };
     }
     case "face_target": {
       if (!t) return { ok: false, reason: "the target is not visible; use search" };
-      if (Math.abs(bearing) < 3) return { ok: false, reason: "already facing the target" };
+      // Within the alignment tolerance approach_target walks straight on: re-centring by a few
+      // degrees only costs a step, and a small far target can be missed in the next frame
+      // (in simulation a bed at 7.4 m was faced twice by 5 deg, then lost).
+      if (Math.abs(bearing) <= limits.alignToleranceDeg) {
+        return { ok: false, reason: `already facing the target (${round(bearing, 0)} deg off); use approach_target` };
+      }
       return { ok: true, action: { kind: "rotate", degrees: bearing } };
     }
     case "approach_target": {
@@ -491,13 +625,48 @@ export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimit
   }
 }
 
+/**
+ * Going around the obstacle that blocked the approach: turn to the detour heading, then walk
+ * as far as the front clearance allows. Overrides the model's intent until done.
+ */
+function planDetour(detour: Detour, obs: Observation, search: SearchState, limits: PolicyLimits): Plan | null {
+  const side = detour.side > 0 ? "left" : "right";
+  const delta = wrapDeg(detour.headingDeg - search.headingDeg);
+  if (Math.abs(delta) > 5) {
+    return { ok: true, action: { kind: "rotate", degrees: round(delta, 1) }, note: `${detour.reason}: turning ${side} to go around the obstacle`, detour: "turn" };
+  }
+  const clearance = obs.front_clearance_m != null ? obs.front_clearance_m - limits.safetyMarginM : limits.unknownClearanceAdvanceM;
+  const meters = round(Math.min(detour.remainingM, clearance), 2);
+  if (meters >= 0.2) {
+    return { ok: true, action: { kind: "advance", meters }, note: `${detour.reason}: walking around the obstacle on the ${side}`, detour: "walk" };
+  }
+  // No room on this side (in simulation a sofa 0.43 m ahead after the turn): try the other
+  // side at once, if detours are left; otherwise the plain intent is planned.
+  if (detour.remainingM < DETOUR_WALK_M || search.detours >= MAX_DETOURS) return null;
+  const other = detour.side > 0 ? "right" : "left";
+  return { ok: true, action: { kind: "rotate", degrees: -detour.side * 2 * DETOUR_TURN_DEG }, note: `${detour.reason}: no room on the ${side}, turning ${other}`, detour: "flip" };
+}
+
+function startDetour(search: SearchState, side: 1 | -1, reason: Detour["reason"]): void {
+  search.detour = { headingDeg: round(wrapDeg(search.headingDeg + side * DETOUR_TURN_DEG), 1), remainingM: DETOUR_WALK_M, side, reason };
+  search.detours += 1;
+  search.lastDetourSide = side;
+}
+
+/** A visible target roughly ahead with no room to advance toward it. */
+function blockedAhead(obs: Observation, limits: PolicyLimits): boolean {
+  const t = obs.target?.visible ? obs.target : null;
+  return t != null && Math.abs(t.bearing_deg ?? 0) <= limits.alignToleranceDeg && maxSafeAdvance(obs, limits) < 0.1;
+}
+
 /** Deterministic fallback used when the reasoning model gives no usable intent. */
 /** Confident YOLO sightings are trusted at once; weaker ones only when seen in two consecutive frames. */
 export function sightingConfirmed(obs: Observation, search: SearchState, limits: PolicyLimits): boolean {
   const t = obs.target;
   if (!t?.visible) return false;
   const strong = t.source === "yolo" && (t.confidence ?? 0) >= limits.strongConfidence;
-  return strong || search.sightingStreak >= 2;
+  if (strong) return true;
+  return !search.closeFirstSighting && search.sightingStreak >= 2;
 }
 
 export function autopilot(obs: Observation, limits: PolicyLimits, search: SearchState): Intent {
@@ -513,14 +682,15 @@ export function autopilot(obs: Observation, limits: PolicyLimits, search: Search
     };
   }
   const t = obs.target?.visible ? obs.target : null;
-  const blockedAhead =
-    t != null && Math.abs(t.bearing_deg ?? 0) <= limits.alignToleranceDeg && maxSafeAdvance(obs, limits) < 0.1;
-  if (blockedAhead && sightingConfirmed(obs, search, limits)) {
+  const blocked = blockedAhead(obs, limits);
+  if (blocked && sightingConfirmed(obs, search, limits)) {
+    // recordObservation starts a detour while there are attempts left from this spot.
+    if (search.detour && planDetour(search.detour, obs, search, limits)) return { kind: "approach_target" };
     return { kind: "finish", success: false, message: "Il percorso verso il bersaglio è bloccato." };
   }
   // An unconfirmed sighting right in front of an obstacle is often the obstacle itself
   // (a sofa taken for a bed): keep searching as if nothing had been seen.
-  if (!t || blockedAhead) {
+  if (!t || blocked) {
     if (search.exploreHeadingDeg != null) return { kind: "explore" };
     if (fullTurnSearched(search, limits)) {
       const canExplore = limits.frontierExploration || chooseExploreHeading(search, limits) != null;
@@ -544,6 +714,7 @@ export function autopilot(obs: Observation, limits: PolicyLimits, search: Search
 /** Update the search state with a new observation, before deciding. */
 export function recordObservation(search: SearchState, obs: Observation, limits: PolicyLimits): void {
   const t = obs.target;
+  checkLastMotion(search, t);
   const pending = search.pendingSightingDeg;
   if (pending != null && !t?.visible && Math.abs(wrapDeg(search.headingDeg - pending)) <= PHANTOM_MATCH_DEG) {
     // The robot turned to an unconfirmed sighting and it was gone (or failed the crop check).
@@ -552,6 +723,22 @@ export function recordObservation(search: SearchState, obs: Observation, limits:
     else search.vanishedDeg.push({ headingDeg: pending, count: 1 });
   }
   search.sightingStreak = t?.visible ? search.sightingStreak + 1 : 0;
+  if (search.farSighting) search.farSighting.age += 1;
+  if (t?.visible) {
+    const heading = wrapDeg(search.headingDeg + (t.bearing_deg ?? 0));
+    const arriveM = limits.stopDistanceM + limits.arriveToleranceM;
+    if (search.sightingStreak === 1) {
+      // An unknown distance counts as close too: the depth often reads a nearer part of a large
+      // object (a sofa filling 70% of the frame, "occluded", was then confirmed as a bed at 0.77 m).
+      const close = (typeof t.distance_m !== "number" || t.distance_m <= arriveM) && (t.height_frac ?? 0) >= CLOSE_FILL_FRAC;
+      const far = search.farSighting;
+      const approached = far != null && far.age <= FAR_SIGHTING_MAX_AGE && Math.abs(wrapDeg(heading - far.headingDeg)) <= FAR_SIGHTING_MATCH_DEG;
+      search.closeFirstSighting = close && !approached;
+    }
+    if (typeof t.distance_m === "number" && t.distance_m > arriveM) search.farSighting = { headingDeg: heading, age: 0 };
+  } else {
+    search.closeFirstSighting = false;
+  }
   search.pendingSightingDeg =
     t?.visible && !sightingConfirmed(obs, search, limits) ? round(wrapDeg(search.headingDeg + (t.bearing_deg ?? 0)), 1) : null;
   // Weak sightings (vision model, low-confidence YOLO) are often similar objects, e.g. a
@@ -559,13 +746,22 @@ export function recordObservation(search: SearchState, obs: Observation, limits:
   // then the search turn and any exploration move are kept, so a false alarm costs one step.
   if (sightingConfirmed(obs, search, limits) && t) {
     // A confirmed sighting restarts the search and cancels any exploration move.
+    if (search.searchedDeg > 0 || search.exploreHeadingDeg != null) search.turnId += 1;
     search.searchedDeg = 0;
+    search.suggestedHeadingDeg = null;
     search.scan = [];
     search.doorwayFrames = [];
     search.exploreHeadingDeg = null;
     search.exploreRemainingM = 0;
     // If the target is lost later, look for it on the side where it was last seen.
     if (Math.abs(t.bearing_deg ?? 0) > 5) search.direction = (t.bearing_deg ?? 0) > 0 ? 1 : -1;
+    if (!search.detour && search.detours < MAX_DETOURS && blockedAhead(obs, limits) && !isGoalReached(obs, limits)) {
+      // Something closer than the target is in the way (in simulation the frame of a glass
+      // door 0.48 m ahead, the bed 3.2 m beyond it, the free passage 60 deg to the left).
+      // Go around it on the target's side first, then on the other side.
+      const side = search.lastDetourSide != null ? (-search.lastDetourSide as 1 | -1) : (t.bearing_deg ?? 0) >= 0 ? 1 : -1;
+      startDetour(search, side, "blocked");
+    }
     return;
   }
   if (search.exploreHeadingDeg != null) return;
@@ -576,13 +772,62 @@ export function recordObservation(search: SearchState, obs: Observation, limits:
   if (doorways.length > 0) search.doorwayFrames.push(doorways);
 }
 
+/** Whether the last motion moved a visible target in the image; two misses in a row start a detour. */
+function checkLastMotion(search: SearchState, t: TargetObservation | null): void {
+  const m = search.lastMotion;
+  search.lastMotion = null;
+  if (!m || !t?.visible || typeof t.bearing_deg !== "number") {
+    if (!t?.visible) search.ineffectiveMotions = 0;
+    return;
+  }
+  let moved = true;
+  if (m.kind === "rotate" && Math.abs(m.amount) >= STUCK_MIN_TURN_DEG) {
+    moved = Math.abs(wrapDeg(t.bearing_deg - m.bearingDeg)) >= STUCK_TURN_FRACTION * Math.abs(m.amount);
+  } else if (m.kind === "advance" && m.amount >= 0.5 && m.distanceM != null && typeof t.distance_m === "number") {
+    moved = Math.abs(t.bearing_deg - m.bearingDeg) >= 3 || t.distance_m < m.distanceM - 0.25 * m.amount;
+  }
+  search.ineffectiveMotions = moved ? 0 : search.ineffectiveMotions + 1;
+  if (search.ineffectiveMotions >= STUCK_MOTIONS && !search.detour && search.detours < MAX_DETOURS) {
+    // The obstacle is usually on the target's side (the frame the robot tried to turn past).
+    startDetour(search, t.bearing_deg >= 0 ? -1 : 1, "stuck");
+    search.ineffectiveMotions = 0;
+  }
+}
+
 /** Update the search state after an action has been executed. */
 export function recordAction(search: SearchState, obs: Observation, action: Action, plan: Plan | null, limits: PolicyLimits): void {
   const explore = plan?.ok ? plan.explore : undefined;
+  const seen = obs.target?.visible && typeof obs.target.bearing_deg === "number" ? obs.target : null;
+  search.lastMotion =
+    seen && (action.kind === "rotate" || action.kind === "advance")
+      ? {
+          kind: action.kind,
+          amount: action.kind === "rotate" ? action.degrees : action.meters,
+          bearingDeg: seen.bearing_deg!,
+          distanceM: typeof seen.distance_m === "number" ? seen.distance_m : null,
+        }
+      : null;
+  if (search.detour) {
+    const way = plan?.ok ? plan.detour : undefined;
+    if (!way) search.detour = null; // no room to go around: back to the plain intent
+    else if (way === "flip") {
+      const side = -search.detour.side as 1 | -1;
+      search.detour = { ...search.detour, side, headingDeg: round(wrapDeg(search.detour.headingDeg + side * 2 * DETOUR_TURN_DEG), 1) };
+      search.detours += 1;
+      search.lastDetourSide = side;
+    } else if (way === "walk" && action.kind === "advance") {
+      search.detour.remainingM -= action.meters;
+      if (search.detour.remainingM < 0.2) search.detour = null;
+    }
+  }
   if (action.kind === "frontier") {
-    // After a Nav2 trip the dead-reckoned heading is meaningless: restart it, and
-    // search a full turn from the new spot.
+    // After a Nav2 trip the dead-reckoned heading and position are meaningless: restart
+    // them (and the graph of places), and search a full turn from the new spot.
     search.headingDeg = 0;
+    search.xM = 0;
+    search.yM = 0;
+    search.places = [];
+    search.placeIndex = null;
     search.exploreHeadingDeg = null;
     endExploration(search, 0);
     search.lastExploreHeadingDeg = null;
@@ -591,6 +836,15 @@ export function recordAction(search: SearchState, obs: Observation, action: Acti
   if (explore && search.exploreHeadingDeg == null) {
     search.exploreHeadingDeg = explore.headingDeg;
     search.exploreRemainingM = limits.exploreStepM;
+    // The edge taken from this place: a later turn here will not be sent the same way again.
+    const place = search.placeIndex != null ? search.places[search.placeIndex] : undefined;
+    if (place && explore.phase !== "frontier") place.exploredDeg.push(round(wrapDeg(explore.headingDeg), 1));
+    search.suggestedHeadingDeg = null;
+  }
+  if (action.kind === "advance") {
+    const a = (search.headingDeg * Math.PI) / 180;
+    search.xM += action.meters * Math.cos(a);
+    search.yM += action.meters * Math.sin(a);
   }
   if (action.kind === "rotate") {
     search.headingDeg = wrapDeg(search.headingDeg + action.degrees);
@@ -624,5 +878,11 @@ function endExploration(search: SearchState, searchedDeg: number): void {
   search.blockedHeadingsDeg = [];
   search.vanishedDeg = [];
   search.pendingSightingDeg = null;
+  search.detour = null;
+  search.detours = 0;
+  search.lastDetourSide = null;
   search.searchedDeg = searchedDeg;
+  search.suggestedHeadingDeg = null;
+  search.placeIndex = null;
+  search.turnId += 1;
 }

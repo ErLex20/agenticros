@@ -23,21 +23,22 @@ Launched by the parent's `scripts/run_nebius_agent.sh`, which loads `.env` and s
 | File | Purpose |
 |------|---------|
 | `index.ts` | Entry point: env parsing (`NEBIUS_*`), MCP client spawn, always `ros2_estop` on exit |
-| `agent.ts` | `GoalAgent`: observe → decide → act loop with Nemotron tool calls, bounded by steps, time and a full search turn |
-| `perception.ts` | Target localization by the vision model (default `NEBIUS_PERCEPTION=vlm`; `yolo` adds tiled YOLO for COCO targets). The vision model returns a bounding box (Kimi-K2.6, default) or a numbered column (MiniCPM-V), per its profile; crop checks of attributes and of vision-model sightings at confirmation and arrival |
+| `agent.ts` | `GoalAgent`: observe → decide → act loop with Nemotron tool calls, bounded by steps, time and a full search turn; without a map, after each full turn without the target it can ask the vision model where to explore (`suggestExploration`, opt-in with `NEBIUS_EXPLORE_CHOICE=vision`, box models only; default `open`: confirmed doorways, then the most open direction). A camera snapshot timeout is a missed observation (no motion), not the end of the task |
+| `perception.ts` | Target localization by the vision model (default `NEBIUS_PERCEPTION=vlm`; `yolo` adds tiled YOLO for COCO targets). The vision model returns a bounding box (Kimi-K2.6, default) or a numbered column (MiniCPM-V), per its profile; crop checks of attributes and of vision-model sightings at confirmation and arrival; `chooseExploreView`: the views of a search turn in one mosaic, the model returns the view and the point to walk toward |
 | `vision.ts` | Pure helpers: per-model vision profiles (grounding, image width, provider fields such as disabling Kimi's thinking), robust JSON extraction, box normalization, reply schema |
-| `policy.ts` | Pure helpers (camera geometry, intent → bounded motion, goal test, deterministic fallback). No ROS, no network |
+| `policy.ts` | Pure helpers (camera geometry, intent → bounded motion, goal test, deterministic fallback, search and exploration state). The no-map graph lives here: dead-reckoned position (`xM`, `yM`), places where the robot searched a full turn with their explored headings (`enterPlace`), and `suggestedHeadingDeg`, which `chooseExploreHeading` prefers. Also the `detour` around an obstacle between the robot and a confirmed target: when two motions in a row leave the target where it was in the image (stuck: turn away from the target's side) or when there is no room to advance toward it (blocked: the target's side first, then the other), turn 40° and walk up to 0.7 m; at most 3 per spot. No ROS, no network |
 | `robot.ts` | Thin wrappers around the MCP tools; turn/forward efficiency compensation for the legged base |
 | `__tests__/policy.test.ts`, `__tests__/vision.test.ts` | Offline unit tests for `policy.ts` and `vision.ts` |
 
 Rules:
 - Keep geometry and safety decisions in deterministic code (`policy.ts`). The LLM picks semantic intents (`search` / `face_target` / `approach_target` / `finish`); the controller bounds, clamps or rejects them.
 - The model never sees ground-truth pose. `AGENTICROS_DEBUG_POSE_TOPIC` is logging-only diagnostics.
-- Logs go to stderr (`[Goal]`, `[Step N]`, `[Scene]`, `[Decision]`, `[Timing]`); stdout carries only the final answer in Italian.
+- Logs go to stderr (`[Goal]`, `[Step N]`, `[Scene]`, `[Decision]`, `[Explore]`, `[Graph]`, `[Timing]`); stdout carries only the final answer in Italian.
 - Never print or log `NEBIUS_API_KEY`.
 - Every vision-model call goes through `Perception.ask()`, which applies the model profile from `vision.ts` (e.g. Kimi-K2.6 thinks by default and needs `chat_template_kwargs: {thinking: false}`). A new vision model needs a profile there and a measurement with the parent's `scripts/vision_eval/` before becoming the default.
 - Geometry rules depend on `TargetObservation.localization` (`box` = tight box from YOLO or a grounding model, `column` = coarse band), not on `source`. `source` only drives trust (YOLO ≥ 0.8 confirmed at once, everything else needs two consecutive frames).
-- Keep the arrival guards: `depthConsistentWithBox` (depth reading an occluder), the 0.5 m cap when the target distance is unknown, and the crop check of vision-model sightings. Each one fixed a false arrival seen in simulation (parent `docs/CHANGELOG.md`).
+- Keep the arrival guards: `depthConsistentWithBox` (depth reading an occluder), the 0.5 m cap when the target distance is unknown, the crop check of vision-model sightings, and `closeFirstSighting` (a target first seen already within arrival distance, or at an unknown distance, filling the frame, is not confirmed by repetition: a sofa 0.37 m ahead passed for a bed). Each one fixed a false arrival seen in simulation (parent `docs/CHANGELOG.md`).
+- The no-map exploration is measured offline with the parent's `scripts/vision_eval/explore_choice_eval.py` and in closed loop with `closed_loop_matrix.sh` (parent `docs/ESPLORAZIONE_GRAFO.md`); change its prompt or rules only with a new measurement.
 - Commits: no Claude co-author (`Co-Authored-By`).
 
 ```bash

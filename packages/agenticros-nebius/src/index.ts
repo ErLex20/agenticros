@@ -106,6 +106,13 @@ async function main(): Promise<void> {
   if (perceptionMode === "vlm" && vision.grounding === "columns") {
     process.stderr.write("[Perception] warning: without YOLO a column-grounding vision model localizes coarsely (±9 deg)\n");
   }
+  // Without a map, the free-space rule picks where to explore by default. With "vision" the
+  // vision model picks it from the views of each turn (box-grounding models only): better
+  // offline (58-65% of the walks toward the target's room against 38%), but in 16 closed-loop
+  // runs in the house both reached a west-wing target 1 time in 5 (parent docs/ESPLORAZIONE_GRAFO.md).
+  const requestedChoice = envChoice("NEBIUS_EXPLORE_CHOICE", ["vision", "open"] as const) ?? "open";
+  const exploreChoice = requestedChoice === "vision" && vision.grounding !== "box" ? "open" : requestedChoice;
+  process.stderr.write(`[Explore] choice=${exploreChoice}\n`);
   const hfovDeg = envPositive("NEBIUS_CAMERA_HFOV_DEG", 110, 179);
   const perception = new Perception(api, {
     vision,
@@ -120,6 +127,7 @@ async function main(): Promise<void> {
     maxSeconds: envPositive("NEBIUS_MAX_SECONDS", 600),
     policy: envString("NEBIUS_POLICY") === "auto" ? "auto" : "llm",
     perception: perceptionMode,
+    exploreChoice,
     camera: {
       heightM: envPositive("NEBIUS_CAMERA_HEIGHT_M", 0.385, 3),
       hfovDeg,

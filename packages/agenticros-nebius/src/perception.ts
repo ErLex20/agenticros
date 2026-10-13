@@ -53,6 +53,61 @@ export interface PerceptionOptions {
   verifyBelowConfidence: number;
 }
 
+/** One view of a search turn, for choosing where to explore next. */
+export interface TurnView {
+  image: Buffer;
+  /** Heading of the view relative to the robot's current heading (deg, positive = left). */
+  relativeDeg: number;
+  /** The robot already walked this way from here, or came from it. */
+  explored: boolean;
+}
+
+export interface ExploreChoice {
+  view: number;
+  /** Horizontal position in the chosen view to walk toward (fraction of its width, 0 = left). */
+  x: number;
+  reason: string;
+}
+
+const EXPLORE_TILE_W = 768;
+const EXPLORE_TILE_H = 432;
+const EXPLORE_SCHEMA = {
+  type: "object",
+  properties: { reason: { type: "string" }, view: { type: "integer" }, x: { type: "number" } },
+  required: ["reason", "view", "x"],
+  additionalProperties: false,
+};
+
+/** The views of a turn in one JPEG, two per row, each labelled with its number and heading. */
+async function turnMosaic(views: TurnView[]): Promise<string> {
+  const cols = 2;
+  const rows = Math.ceil(views.length / cols);
+  const tiles = await Promise.all(
+    views.map(async (v, k) => {
+      const deg = Math.round(v.relativeDeg);
+      const label = `view ${k}: ${deg >= 0 ? "+" : ""}${deg} deg${v.explored ? " (explored)" : ""}`;
+      const svg = Buffer.from(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${EXPLORE_TILE_W}" height="${EXPLORE_TILE_H}">` +
+          `<rect x="0" y="0" width="${label.length * 19 + 20}" height="50" fill="black"/>` +
+          `<text x="10" y="37" font-size="32" font-family="sans-serif" font-weight="bold" fill="#ffff00">${label}</text></svg>`,
+      );
+      const input = await sharp(v.image)
+        .resize({ width: EXPLORE_TILE_W, height: EXPLORE_TILE_H, fit: "fill" })
+        .composite([{ input: svg }])
+        .png()
+        .toBuffer();
+      return { input, left: (k % cols) * EXPLORE_TILE_W, top: Math.floor(k / cols) * EXPLORE_TILE_H };
+    }),
+  );
+  const jpeg = await sharp({
+    create: { width: cols * EXPLORE_TILE_W, height: rows * EXPLORE_TILE_H, channels: 3, background: { r: 0, g: 0, b: 0 } },
+  })
+    .composite(tiles)
+    .jpeg({ quality: 80, mozjpeg: true })
+    .toBuffer();
+  return `data:image/jpeg;base64,${jpeg.toString("base64")}`;
+}
+
 export interface SceneResult {
   summary: string;
   target: TargetObservation | null;
@@ -329,6 +384,48 @@ export class Perception {
       },
       doorwayBearingsDeg,
     };
+  }
+
+  /**
+   * Where to explore after a full turn without the target: the vision model sees all the
+   * views of the turn at once and picks one, plus the point to walk toward in it. Measured on
+   * the house frames (parent scripts/vision_eval/explore_choice_eval.py): a 2.5 m walk that
+   * way got closer to the target's room in 58% of the cases (74% for rooms behind a passage),
+   * against 38% (21%) for the most open direction.
+   */
+  async chooseExploreView(views: TurnView[], target: TargetSpec): Promise<ExploreChoice | null> {
+    if (views.length < 2 || !this.opts.vision.structuredOutput) return null;
+    const content = await this.ask(
+      [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                `The image shows the ${views.length} views of a full turn in place of a quadruped robot inside a house; each view is ` +
+                "labelled with its number and its heading relative to the robot (positive = left). Views marked (explored) face a " +
+                "way the robot already walked from here or came from. " +
+                `The robot is looking for: ${targetText(target)}. It is not visible in any view. Which view should the robot walk ` +
+                "toward to find it? Think about which room each view shows and where doorways, corridors or passages lead: e.g. a " +
+                "bed is in a bedroom, usually reached through a doorway or corridor; a refrigerator is in the kitchen. Glass doors " +
+                "and windows cannot be walked through. Choose an explored view only if no other view can lead to the target. " +
+                'Return JSON: {"reason": string (one or two sentences), "view": <view number>, "x": number (horizontal position ' +
+                "in the chosen view of the doorway, passage or free floor to walk toward, as a fraction of that view's width: " +
+                "0.0 = its left edge, 1.0 = its right edge)}",
+            },
+            { type: "image_url", image_url: { url: await turnMosaic(views) } },
+          ],
+        },
+      ],
+      500,
+      EXPLORE_SCHEMA,
+    );
+    const parsed = parseJsonObject(content);
+    const view = Number(parsed?.["view"]);
+    const x = Number(parsed?.["x"]);
+    if (!Number.isInteger(view) || view < 0 || view >= views.length || !Number.isFinite(x)) return null;
+    return { view, x: Math.min(1, Math.max(0, x)), reason: String(parsed?.["reason"] ?? "") };
   }
 
   async dispose(): Promise<void> {
