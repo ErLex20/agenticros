@@ -147,12 +147,17 @@ export interface DepthSampleResult {
   roi?: DepthRoi;
 }
 
-export async function getDepthDistance(
-  transport: RosTransport,
-  topic: string,
-  timeoutMs = 5000,
-  roi?: DepthRoi,
-): Promise<DepthSampleResult> {
+interface DepthImage {
+  encoding: string;
+  width: number;
+  height: number;
+  step: number;
+  isBigEndian: boolean;
+  data: Uint8Array;
+}
+
+/** Next depth image on the topic. */
+async function readDepthImage(transport: RosTransport, topic: string, timeoutMs: number): Promise<DepthImage> {
   const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
     const sub = transport.subscribe(
       { topic, type: ROS_MSG_IMAGE },
@@ -182,7 +187,16 @@ export async function getDepthDistance(
       : width * bpp;
   const isBigEndian = rosBoolField(result.is_bigendian);
   const data = depthImageDataBytes(result.data);
+  return { encoding, width, height, step, isBigEndian, data };
+}
 
+export async function getDepthDistance(
+  transport: RosTransport,
+  topic: string,
+  timeoutMs = 5000,
+  roi?: DepthRoi,
+): Promise<DepthSampleResult> {
+  const { encoding, width, height, step, isBigEndian, data } = await readDepthImage(transport, topic, timeoutMs);
   const values = sanitizeDepthSamplesMeters(
     sampleDepthMeters(width, height, step, encoding, data, 0.3, isBigEndian, roi),
   );
@@ -204,5 +218,89 @@ export async function getDepthDistance(
     min_m: Math.round(min_m * 1000) / 1000,
     max_m: Math.round(max_m * 1000) / 1000,
     ...(roi ? { roi } : {}),
+  };
+}
+
+/** Geometry of the corridor in front of the robot body, for a level camera with planar depth. */
+export interface DepthCorridor {
+  /** Camera height above the floor (m). */
+  camera_height_m: number;
+  /** Horizontal field of view of the depth image (deg). */
+  hfov_deg: number;
+  /** Half width of the corridor (m): the body's half width plus a margin. */
+  half_width_m: number;
+  /** Points lower than this above the floor are floor (m). */
+  min_height_m: number;
+  /** Points higher than this are above the body (m). */
+  max_height_m: number;
+  /** Nearer points are the robot itself, e.g. its front legs at the bottom of the image (m). */
+  min_depth_m: number;
+}
+
+export interface DepthCorridorResult {
+  valid: boolean;
+  /** Distance of the nearest obstacle inside the corridor (k-th nearest pixel), null when clear. */
+  distance_m: number | null;
+  obstacle_pixels: number;
+  topic: string;
+  width: number;
+  height: number;
+}
+
+/** Pixels needed for an obstacle: a few stray ones are noise. */
+const CORRIDOR_K_NEAREST = 25;
+
+/**
+ * Nearest obstacle in the robot's path: the depth pixels whose 3D point lies in front of the
+ * body (|lateral| <= half width) between the floor and the body height, at any image row. A band
+ * of the image above the horizon misses objects lower than the camera (a bin, a coffee table).
+ */
+export async function getDepthCorridor(
+  transport: RosTransport,
+  topic: string,
+  corridor: DepthCorridor,
+  timeoutMs = 5000,
+): Promise<DepthCorridorResult> {
+  const { encoding, width, height, step, isBigEndian, data } = await readDepthImage(transport, topic, timeoutMs);
+  const enc = normalizeDepthImageEncoding(encoding);
+  if (enc !== "16UC1" && enc !== "32FC1") {
+    throw new Error(`Unsupported depth encoding: "${encoding}". Use 16UC1/mono16 (mm) or 32FC1 (m).`);
+  }
+  const tanH = Math.tan((corridor.hfov_deg * Math.PI) / 360);
+  const tanV = (tanH * height) / width;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const near: number[] = [];
+  for (let y = 0; y < height; y++) {
+    const down = ((y + 0.5) / height - 0.5) * 2 * tanV;
+    for (let x = 0; x < width; x++) {
+      let z: number;
+      if (enc === "32FC1") {
+        const off = y * step + x * 4;
+        if (off + 4 > data.length) continue;
+        z = view.getFloat32(off, !isBigEndian);
+      } else {
+        const off = y * step + x * 2;
+        if (off + 2 > data.length) continue;
+        const lo = data[off]!;
+        const hi = data[off + 1]!;
+        z = (isBigEndian ? (lo << 8) | hi : (hi << 8) | lo) / 1000;
+      }
+      if (!Number.isFinite(z) || z < corridor.min_depth_m || z > DEPTH_SAMPLE_MAX_M) continue;
+      const lateral = z * ((x + 0.5) / width - 0.5) * 2 * tanH;
+      if (Math.abs(lateral) > corridor.half_width_m) continue;
+      const above = corridor.camera_height_m - z * down;
+      if (above < corridor.min_height_m || above > corridor.max_height_m) continue;
+      near.push(z);
+    }
+  }
+  near.sort((a, b) => a - b);
+  const distance = near.length >= CORRIDOR_K_NEAREST ? near[CORRIDOR_K_NEAREST - 1]! : null;
+  return {
+    valid: true,
+    distance_m: distance != null ? Math.round(distance * 1000) / 1000 : null,
+    obstacle_pixels: near.length,
+    topic,
+    width,
+    height,
   };
 }

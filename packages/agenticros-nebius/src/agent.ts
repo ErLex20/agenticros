@@ -24,6 +24,7 @@ import { Perception, parseJsonObject, type PerceptionMode, type TargetSpec, type
 import {
   DEFAULT_LIMITS,
   FRONTIER_MAX_EXPLORATIONS,
+  applyImuYaw,
   autopilot,
   bearingFromImageX,
   depthConsistentWithBox,
@@ -55,6 +56,8 @@ import type { NavigationCapabilities, Place, RobotTools } from "./robot.js";
  * A wider band catches objects beside the path, e.g. pillars flanking the target.
  */
 const FRONT_ROI = { x_min: 0.4, y_min: 0.25, x_max: 0.6, y_max: 0.5 };
+/** Half width of the 3D corridor in front of the body checked for low obstacles (Go2 ~0.31 m wide, plus margin). */
+const CORRIDOR_HALF_WIDTH_M = 0.25;
 
 /** Upper bound on explicit motions parsed from one request. */
 const MAX_EXPLICIT_MOVES = 8;
@@ -87,6 +90,12 @@ export interface AgentConfig {
   /** "vlm" (default): vision model only; "yolo": local detector for COCO targets plus the vision model. */
   perception: PerceptionMode;
   camera: CameraGeometry;
+  /**
+   * Also check a 3D corridor in front of the body (ros2_depth_corridor) for obstacles lower than
+   * the camera: the band above the horizon missed a bin, a coffee table and a dumbbell, and the
+   * robot got stuck against them.
+   */
+  depthCorridor: boolean;
   /**
    * Where to explore after a full turn without the target (no Nav2 frontiers): "vision" asks
    * the vision model with all the views of the turn; "open" uses confirmed doorways, then the
@@ -128,6 +137,8 @@ function describeAction(action: Action): string {
       return `rotate(${round(action.degrees, 0)} deg)`;
     case "advance":
       return `advance(${round(action.meters)} m)`;
+    case "backup":
+      return `backup(${round(action.meters)} m)`;
     case "frontier":
       return "nav2_frontier()";
     case "finish":
@@ -252,6 +263,10 @@ export class GoalAgent {
   private readonly perception: Perception;
   /** Camera frame of the latest observation (crop checks of vision-model sightings). */
   private lastImage: Buffer | null = null;
+  /** IMU heading read right after the latest camera frame (null without an IMU). */
+  private imuYawAtObservation: number | null = null;
+  /** Seconds of IMU data the MCP server could not integrate so far (message gaps). */
+  private imuSkippedS = 0;
   /** Frames of the current search turn with their dead-reckoned headings, for the exploration choice. */
   private turnViews: { turnId: number; views: { headingDeg: number; image: Buffer }[] } = { turnId: -1, views: [] };
   /** Turn for which the vision model was already asked where to explore. */
@@ -348,6 +363,27 @@ export class GoalAgent {
   }
 
   /** Latest observation, or null when the vision model, the only localizer here, gave no usable reply. */
+  /**
+   * Free space ahead: the band above the horizon and, if enabled, the corridor in front of the
+   * body, whichever is nearer. A failed reading is "unknown" (null), never "clear".
+   */
+  private async frontClearance(): Promise<number | null> {
+    const [band, corridor] = await Promise.all([
+      this.robot.depth(FRONT_ROI).catch(() => null),
+      this.cfg.depthCorridor
+        ? this.robot
+            .depthCorridor({ cameraHeightM: this.cfg.camera.heightM, hfovDeg: this.cfg.camera.hfovDeg, halfWidthM: CORRIDOR_HALF_WIDTH_M })
+            .catch(() => null)
+        : Promise.resolve(null),
+    ]);
+    const low = corridor?.distance ?? null;
+    if (low == null) return band;
+    if (band == null || low < band - 0.3) {
+      log(`[Perception] obstacle in the corridor at ${round(low)} m (band above the horizon: ${band != null ? `${round(band)} m` : "unknown"})`);
+    }
+    return band == null ? low : Math.min(band, low);
+  }
+
   private async observe(step: number, goal: string, target: TargetSpec | null): Promise<Observation | null> {
     const startedAt = performance.now();
     // A camera timeout is a missed observation, not the end of the task (it ended a 57-step
@@ -359,9 +395,11 @@ export class GoalAgent {
     if (!snapshot) return null;
     this.lastImage = snapshot.image;
     log(`[Timing] AgenticROS snapshot: ${elapsed(startedAt)}s`);
+    // The heading the frame was taken at: read with the frame, applied before deciding.
+    const imuP = this.robot.imuYaw().catch(() => null);
 
     // A failed reading is "unknown" (null), never "clear": the policy then limits advances.
-    const clearanceP = this.robot.depth(FRONT_ROI).catch(() => null);
+    const clearanceP = this.frontClearance();
     // In yolo mode COCO targets are localized by YOLO first; the vision model still localizes
     // them as a fallback (YOLO misses many rendered objects in simulation), so its failure must
     // not abort the run. In vlm mode the vision model is the only localizer.
@@ -410,6 +448,12 @@ export class GoalAgent {
       }
     }
     const clearance = await clearanceP;
+    const imu = await imuP;
+    this.imuYawAtObservation = imu?.yawDeg ?? null;
+    if (imu && imu.skippedS > this.imuSkippedS + 0.05) {
+      log(`[Heading] IMU: ${round(imu.skippedS - this.imuSkippedS)} s of gyroscope data missing (message gaps)`);
+    }
+    if (imu) this.imuSkippedS = imu.skippedS;
     log(`[Timing] Perception: ${elapsed(startedAt)}s`);
     return {
       step,
@@ -498,6 +542,7 @@ export class GoalAgent {
     const startedAt = performance.now();
     if (action.kind === "rotate") await this.robot.rotate(action.degrees);
     else if (action.kind === "advance") await this.robot.advance(action.meters);
+    else if (action.kind === "backup") await this.robot.backUp(action.meters);
     log(`[Timing] AgenticROS ${describeAction(action)}: ${elapsed(startedAt)}s`);
   }
 
@@ -529,6 +574,12 @@ export class GoalAgent {
         continue;
       }
       perceptionFailures = 0;
+      if (this.imuYawAtObservation != null) {
+        const turn = applyImuYaw(search, this.imuYawAtObservation);
+        if (turn && Math.abs(turn.measuredDeg - turn.commandedDeg) >= 5) {
+          log(`[Heading] IMU: turned ${round(turn.measuredDeg, 0)} deg, commanded ${round(turn.commandedDeg, 0)} deg`);
+        }
+      }
       if (obs.target?.visible && isPhantomSighting(obs, search, limits)) {
         log(`[Perception] ignoring the sighting at ${obs.target.bearing_deg} deg: it vanished twice when faced from here`);
         obs.target = { visible: false, source: obs.target.source, localization: obs.target.localization ?? "box" };
@@ -700,7 +751,7 @@ export class GoalAgent {
     for (const move of moves) {
       if ((performance.now() - startedAt) / 1000 > this.cfg.maxSeconds) return stopped("tempo massimo esaurito");
       if (move.kind === "advance") {
-        const clearance = await this.robot.depth(FRONT_ROI).catch(() => null);
+        const clearance = await this.frontClearance();
         const search: SearchState = newSearchState(1);
         const check = planIntent(move, { step: 0, target: null, front_clearance_m: clearance }, this.cfg.limits, search);
         if (!check.ok) return stopped(check.reason);

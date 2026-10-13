@@ -52,7 +52,8 @@ import {
 import { resolveMemoryNamespace } from "@agenticros/core";
 import { getTransportForRobot } from "./transport.js";
 import { checkPublishSafety } from "./safety.js";
-import { getDepthDistance, parseDepthRoi } from "./depth.js";
+import { getDepthCorridor, getDepthDistance, parseDepthRoi } from "./depth.js";
+import { getImuYaw } from "./imu-yaw.js";
 import { getFollowMeLocal, stopFollowMeLocalIfPresent } from "./follow-me/loop.js";
 import { getFollowMeDepth, stopFollowMeDepthIfPresent } from "./follow-me/depth-loop.js";
 import { findObject } from "@agenticros/object-detection";
@@ -328,6 +329,36 @@ export const TOOLS: McpTool[] = [
         roi_y_max: { type: "number", minimum: 0, maximum: 1, description: "Optional region bottom edge (1 = image bottom)." },
         timeout: { type: "number", description: "Timeout in ms (default 5000)" },
         robot_id: { type: "string", description: "Optional robot id (from ros2_list_robots) to scope this call. When omitted, the active robot is used." },
+      },
+    },
+  },
+  {
+    name: "ros2_depth_corridor",
+    description:
+      "Distance in meters to the nearest obstacle in the robot's path: depth pixels whose 3D point lies in a corridor in front of the body (within half_width_m sideways, between min_height_m and max_height_m above the floor), for a level camera with planar depth. Unlike a region of the image above the horizon it also sees objects lower than the camera. distance_m is null when the corridor is clear as far as the depth sees.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: { type: "string", description: `Depth image topic (default: ${DEFAULT_DEPTH_TOPIC})` },
+        camera_height_m: { type: "number", minimum: 0.05, maximum: 3, description: "Camera height above the floor in meters." },
+        hfov_deg: { type: "number", minimum: 10, maximum: 179, description: "Horizontal field of view of the depth image in degrees." },
+        half_width_m: { type: "number", minimum: 0.05, maximum: 2, description: "Half width of the corridor (default 0.25)." },
+        min_height_m: { type: "number", minimum: 0, maximum: 1, description: "Points lower than this above the floor are floor (default 0.05)." },
+        max_height_m: { type: "number", minimum: 0.1, maximum: 3, description: "Points higher than this are ignored (default 1.0)." },
+        min_depth_m: { type: "number", minimum: 0, maximum: 2, description: "Nearer points are the robot itself (default 0.3)." },
+        timeout: { type: "number", description: "Timeout in ms (default 5000)" },
+      },
+      required: ["camera_height_m", "hfov_deg"],
+    },
+  },
+  {
+    name: "ros2_imu_yaw",
+    description:
+      "Heading change of the robot integrated from an IMU gyroscope (degrees, counter-clockwise positive, unwrapped) since the first call on the topic. Compare two readings to measure how much the robot really turned, e.g. around a commanded rotation. Uses the angular velocity only (orientation just for roll and pitch), never the absolute yaw.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: { type: "string", description: "sensor_msgs/Imu topic (default: AGENTICROS_IMU_TOPIC)" },
       },
     },
   },
@@ -1597,6 +1628,46 @@ export async function handleToolCall(
           isError: true,
         };
       }
+    }
+
+    case "ros2_depth_corridor": {
+      const rawTopic = (args["topic"] as string | undefined)?.trim() || DEFAULT_DEPTH_TOPIC;
+      const topic = resolveCameraSubscribeTopic(robot.namespace, rawTopic);
+      const num = (key: string, fallback?: number): number => {
+        const v = args[key];
+        if (v == null && fallback != null) return fallback;
+        if (typeof v !== "number" || !Number.isFinite(v)) throw new Error(`${key} must be a finite number`);
+        return v;
+      };
+      try {
+        const result = await getDepthCorridor(transport, topic, {
+          camera_height_m: num("camera_height_m"),
+          hfov_deg: num("hfov_deg"),
+          half_width_m: num("half_width_m", 0.25),
+          min_height_m: num("min_height_m", 0.05),
+          max_height_m: num("max_height_m", 1.0),
+          min_depth_m: num("min_depth_m", 0.3),
+        }, (args["timeout"] as number | undefined) ?? 5000);
+        const text = result.distance_m != null
+          ? `Nearest obstacle in the corridor: **${result.distance_m} m** (${result.obstacle_pixels} pixels). Topic: ${result.topic}.\n${JSON.stringify(result)}`
+          : `Corridor clear as far as the depth sees (${result.obstacle_pixels} obstacle pixels). Topic: ${result.topic}.\n${JSON.stringify(result)}`;
+        return { content: [{ type: "text", text }] };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text", text: `Depth corridor failed: ${message}` }], isError: true };
+      }
+    }
+
+    case "ros2_imu_yaw": {
+      const rawTopic = (args["topic"] as string | undefined)?.trim() || process.env.AGENTICROS_IMU_TOPIC?.trim();
+      if (!rawTopic) {
+        return { content: [{ type: "text", text: "No IMU topic: pass topic or set AGENTICROS_IMU_TOPIC." }], isError: true };
+      }
+      const reading = await getImuYaw(transport, rawTopic);
+      const text = reading.valid
+        ? `IMU heading change: ${reading.yaw_deg} deg (${reading.samples} samples). Topic: ${reading.topic}.\n${JSON.stringify(reading)}`
+        : `No recent IMU data on ${reading.topic}.\n${JSON.stringify(reading)}`;
+      return { content: [{ type: "text", text }] };
     }
 
     case "ros2_follow_me_start": {

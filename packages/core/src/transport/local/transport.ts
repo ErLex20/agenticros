@@ -189,7 +189,7 @@ export class LocalTransport implements RosTransport {
         `Cannot subscribe to ${options.topic}: type is required when it cannot be inferred`,
       );
     }
-    return this.entityCache!.addSubscription(this.node, options.topic, type, handler);
+    return this.entityCache!.addSubscription(this.node, options.topic, type, handler, options.queueLength);
   }
 
   // --- Services ---

@@ -49,6 +49,8 @@ export interface Observation {
 export type Action =
   | { kind: "rotate"; degrees: number }
   | { kind: "advance"; meters: number }
+  /** Walk backwards: only to free the body after a rotation the IMU found blocked. */
+  | { kind: "backup"; meters: number }
   /** Drive with Nav2 to the nearest unexplored frontier of the live (SLAM) map. */
   | { kind: "frontier" }
   | { kind: "finish"; success: boolean; message: string };
@@ -195,6 +197,26 @@ export interface SearchState {
   /** Detours started from this spot, and the side of the latest one. */
   detours: number;
   lastDetourSide: 1 | -1 | null;
+  /**
+   * IMU heading (integrated gyroscope, deg) at the last correction, and the commanded turn added
+   * to headingDeg since then (of which searchSinceImuDeg counted as searched). With an IMU the
+   * measured turn replaces the commanded one: in simulation rotations commanded next to low
+   * furniture turned 40% of the command (median) and the dead-reckoned heading drifted by 180 deg.
+   */
+  imuYawDeg: number | null;
+  turnSinceImuDeg: number;
+  searchSinceImuDeg: number;
+  /**
+   * The last rotation turned less than half the command (IMU): the body touches something at
+   * its side or back. In simulation the robot pivoted around the corner of a low dumbbell rack
+   * (turns of 30-47%) until it was wedged against it and nothing freed it, and 6 rotations in a
+   * row between a bin and a coffee table did not turn at all. The robot then tries the
+   * UNSTICK_STEPS in turn from that spot (unsticks counts them) and the controller picks the
+   * search direction; blockedTurnDeg is the commanded turn that failed.
+   */
+  blockedTurn: boolean;
+  blockedTurnDeg: number;
+  unsticks: number;
   /** Absolute heading of the latest unconfirmed sighting, to tell whether it vanishes once faced. */
   pendingSightingDeg: number | null;
   /**
@@ -257,6 +279,17 @@ const DETOUR_TURN_DEG = 40;
 const DETOUR_WALK_M = 0.7;
 /** Detours from one spot before a blocked path ends the approach. */
 const MAX_DETOURS = 3;
+/** A rotation of at least this much (deg) that turns less than this fraction is blocked. */
+const BLOCKED_TURN_MIN_DEG = 30;
+const BLOCKED_TURN_FRACTION = 0.5;
+/**
+ * Ways out of a blocked rotation, tried in turn from one spot: step forward, away from what the
+ * body touches at its side or back and where the depth sees (back instead without room ahead),
+ * turn the other way, walk back. Then the robot stops: it is stuck.
+ */
+const UNSTICK_STEPS = ["forward", "reverse", "forward", "backup", "reverse"] as const;
+const UNSTICK_M = 0.3;
+const UNSTICK_TURN_DEG = 45;
 /** Vanishings at one heading after which sightings there are ignored from this spot. */
 const PHANTOM_VANISHINGS = 2;
 
@@ -280,6 +313,12 @@ export function newSearchState(direction: 1 | -1): SearchState {
     detour: null,
     detours: 0,
     lastDetourSide: null,
+    imuYawDeg: null,
+    turnSinceImuDeg: 0,
+    searchSinceImuDeg: 0,
+    blockedTurn: false,
+    blockedTurnDeg: 0,
+    unsticks: 0,
     pendingSightingDeg: null,
     vanishedDeg: [],
     xM: 0,
@@ -464,6 +503,8 @@ export type Plan =
        * SearchState.detour); "flip" turns to the other side when this one has no room.
        */
       detour?: "turn" | "walk" | "flip";
+      /** A move to free the body after a rotation the IMU found blocked (UNSTICK_STEPS). */
+      unstick?: true;
     }
   | { ok: false; reason: string };
 
@@ -471,6 +512,7 @@ export type Plan =
 export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimits, search: SearchState): Plan {
   const t = obs.target?.visible ? obs.target : null;
   const bearing = t?.bearing_deg ?? 0;
+  if (search.blockedTurn && intent.kind !== "finish") return planUnstick(obs, search, limits);
   if (search.detour && intent.kind === "finish" && !intent.success && planDetour(search.detour, obs, search, limits)) {
     return { ok: false, reason: "going around the obstacle first (detour in progress)" };
   }
@@ -500,7 +542,8 @@ export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimit
           ? { ok: false, reason: `already searched ${round(search.searchedDeg, 0)} deg here without seeing the target; use explore` }
           : { ok: false, reason: `already searched ${round(search.searchedDeg, 0)} deg without seeing the target; finish` };
       }
-      const direction = intent.direction ?? search.direction;
+      // After a blocked rotation the controller keeps the direction it switched to.
+      const direction = search.unsticks > 0 ? search.direction : intent.direction ?? search.direction;
       return { ok: true, action: { kind: "rotate", degrees: direction * limits.searchStepDeg } };
     }
     case "explore": {
@@ -610,6 +653,9 @@ export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimit
     case "frontier":
       // Produced by the explore intent, never requested directly.
       return { ok: false, reason: "use explore" };
+    case "backup":
+      // Produced after a rotation the IMU found blocked, never requested directly.
+      return { ok: false, reason: "backing up is decided by the controller" };
     case "finish": {
       if (intent.success && !isGoalReached(obs, limits)) {
         return {
@@ -645,6 +691,26 @@ function planDetour(detour: Detour, obs: Observation, search: SearchState, limit
   if (detour.remainingM < DETOUR_WALK_M || search.detours >= MAX_DETOURS) return null;
   const other = detour.side > 0 ? "right" : "left";
   return { ok: true, action: { kind: "rotate", degrees: -detour.side * 2 * DETOUR_TURN_DEG }, note: `${detour.reason}: no room on the ${side}, turning ${other}`, detour: "flip" };
+}
+
+/** Next way out of a blocked rotation (UNSTICK_STEPS), or the end of the task when none is left. */
+function planUnstick(obs: Observation, search: SearchState, limits: PolicyLimits): Plan {
+  const step = UNSTICK_STEPS[search.unsticks];
+  if (!step) {
+    return {
+      ok: true,
+      action: { kind: "finish", success: false, message: "Il robot è bloccato: non riesce a girare e i tentativi di liberarsi non sono bastati." },
+    };
+  }
+  const n = `${search.unsticks + 1}/${UNSTICK_STEPS.length}`;
+  if (step === "reverse") {
+    const degrees = (search.blockedTurnDeg >= 0 ? -1 : 1) * UNSTICK_TURN_DEG;
+    return { ok: true, action: { kind: "rotate", degrees }, note: `rotation blocked (IMU), unstick ${n}: turning the other way`, unstick: true };
+  }
+  if (step === "forward" && maxSafeAdvance(obs, limits) >= UNSTICK_M) {
+    return { ok: true, action: { kind: "advance", meters: UNSTICK_M }, note: `rotation blocked (IMU), unstick ${n}: stepping forward`, unstick: true };
+  }
+  return { ok: true, action: { kind: "backup", meters: UNSTICK_M }, note: `rotation blocked (IMU), unstick ${n}: backing up`, unstick: true };
 }
 
 function startDetour(search: SearchState, side: 1 | -1, reason: Detour["reason"]): void {
@@ -709,6 +775,29 @@ export function autopilot(obs: Observation, limits: PolicyLimits, search: Search
     return { kind: "search" };
   }
   return { kind: "approach_target" };
+}
+
+/**
+ * Replace the commanded turns since the previous IMU reading with the measured one: heading,
+ * and the searched angle for the turns that counted as search. The first reading is the
+ * baseline. Returns the commanded and measured turn, for logging.
+ */
+export function applyImuYaw(search: SearchState, imuYawDeg: number): { commandedDeg: number; measuredDeg: number } | null {
+  const previous = search.imuYawDeg;
+  const commanded = search.turnSinceImuDeg;
+  const counted = search.searchSinceImuDeg;
+  search.imuYawDeg = imuYawDeg;
+  search.turnSinceImuDeg = 0;
+  search.searchSinceImuDeg = 0;
+  if (previous == null) return null;
+  const measured = imuYawDeg - previous;
+  search.blockedTurn = Math.abs(commanded) >= BLOCKED_TURN_MIN_DEG && Math.abs(measured) < BLOCKED_TURN_FRACTION * Math.abs(commanded);
+  if (search.blockedTurn) search.blockedTurnDeg = commanded;
+  search.headingDeg = round(wrapDeg(search.headingDeg + measured - commanded), 1);
+  if (counted > 0 && Math.abs(commanded) > 1) {
+    search.searchedDeg = Math.max(0, search.searchedDeg - counted + (Math.abs(measured) * counted) / Math.abs(commanded));
+  }
+  return { commandedDeg: commanded, measuredDeg: measured };
 }
 
 /** Update the search state with a new observation, before deciding. */
@@ -797,6 +886,25 @@ function checkLastMotion(search: SearchState, t: TargetObservation | null): void
 /** Update the search state after an action has been executed. */
 export function recordAction(search: SearchState, obs: Observation, action: Action, plan: Plan | null, limits: PolicyLimits): void {
   const explore = plan?.ok ? plan.explore : undefined;
+  search.blockedTurn = false; // used for this step's plan; the next IMU reading sets it again
+  if (plan?.ok && plan.unstick) {
+    // Search the rest of the turn the other way round: the blocked way may stay blocked.
+    if (search.unsticks === 0) search.direction = search.direction === 1 ? -1 : 1;
+    search.unsticks += 1;
+    search.lastMotion = null;
+    const a = (search.headingDeg * Math.PI) / 180;
+    if (action.kind === "backup") {
+      search.xM -= action.meters * Math.cos(a);
+      search.yM -= action.meters * Math.sin(a);
+    } else if (action.kind === "advance") {
+      search.xM += action.meters * Math.cos(a);
+      search.yM += action.meters * Math.sin(a);
+    } else if (action.kind === "rotate") {
+      search.headingDeg = wrapDeg(search.headingDeg + action.degrees);
+      search.turnSinceImuDeg += action.degrees;
+    }
+    return;
+  }
   const seen = obs.target?.visible && typeof obs.target.bearing_deg === "number" ? obs.target : null;
   search.lastMotion =
     seen && (action.kind === "rotate" || action.kind === "advance")
@@ -824,6 +932,7 @@ export function recordAction(search: SearchState, obs: Observation, action: Acti
     // After a Nav2 trip the dead-reckoned heading and position are meaningless: restart
     // them (and the graph of places), and search a full turn from the new spot.
     search.headingDeg = 0;
+    search.imuYawDeg = null;
     search.xM = 0;
     search.yM = 0;
     search.places = [];
@@ -848,7 +957,11 @@ export function recordAction(search: SearchState, obs: Observation, action: Acti
   }
   if (action.kind === "rotate") {
     search.headingDeg = wrapDeg(search.headingDeg + action.degrees);
-    if (!explore && !sightingConfirmed(obs, search, limits)) search.searchedDeg += Math.abs(action.degrees);
+    search.turnSinceImuDeg += action.degrees;
+    if (!explore && !sightingConfirmed(obs, search, limits)) {
+      search.searchedDeg += Math.abs(action.degrees);
+      search.searchSinceImuDeg += Math.abs(action.degrees);
+    }
   }
   if (explore?.phase === "walk" && action.kind === "advance") {
     search.exploreRemainingM -= action.meters;
@@ -881,7 +994,9 @@ function endExploration(search: SearchState, searchedDeg: number): void {
   search.detour = null;
   search.detours = 0;
   search.lastDetourSide = null;
+  search.unsticks = 0;
   search.searchedDeg = searchedDeg;
+  search.searchSinceImuDeg = searchedDeg; // the rotation that replaced a blocked walk, if any
   search.suggestedHeadingDeg = null;
   search.placeIndex = null;
   search.turnId += 1;

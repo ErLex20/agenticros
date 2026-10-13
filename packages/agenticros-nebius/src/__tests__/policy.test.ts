@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_LIMITS,
+  applyImuYaw,
   autopilot,
   bearingFromImageX,
   isGoalReached,
@@ -627,4 +628,62 @@ test("a first sighting that fills the frame at an unknown distance is not confir
   const t = newSearchState(-1);
   recordObservation(t, obs({ target: { visible: true, source: "vlm", localization: "box", bearing_deg: 5, distance_m: null, height_frac: 0.2 }, front_clearance_m: 3 }), LIMITS);
   assert.equal(t.closeFirstSighting, false);
+});
+
+test("with an IMU the measured turn replaces the commanded one in the heading and the searched angle", () => {
+  // Simulation: next to a low bin a -90 deg search rotation turned -41 deg.
+  const s = newSearchState(-1);
+  assert.equal(applyImuYaw(s, 12.5), null); // baseline
+  const hidden = obs({ target: { visible: false, source: "vlm" }, front_clearance_m: 3 });
+  recordAction(s, hidden, { kind: "rotate", degrees: -90 }, null, LIMITS);
+  assert.equal(s.headingDeg, -90);
+  assert.equal(s.searchedDeg, 90);
+  assert.deepEqual(applyImuYaw(s, 12.5 - 41), { commandedDeg: -90, measuredDeg: -41 });
+  assert.equal(s.headingDeg, -41);
+  assert.equal(s.searchedDeg, 41);
+  // A walk that drifts by 3 deg moves the heading too; the searched angle is untouched.
+  recordAction(s, hidden, { kind: "advance", meters: 1 }, null, LIMITS);
+  applyImuYaw(s, 12.5 - 41 + 3);
+  assert.equal(s.headingDeg, -38);
+  assert.equal(s.searchedDeg, 41);
+});
+
+test("a rotation the IMU finds blocked starts a sequence of ways out, then the robot stops", () => {
+  // Simulation: a leg caught on a dumbbell; two 0.3 m back-ups did not free it and 40 rotations followed.
+  const s = newSearchState(-1);
+  applyImuYaw(s, 0);
+  const hidden = obs({ target: { visible: false, source: "vlm" }, front_clearance_m: 3 });
+  const blockedAgain = () => {
+    recordAction(s, hidden, { kind: "rotate", degrees: -90 }, null, LIMITS);
+    applyImuYaw(s, (s.imuYawDeg ?? 0) - 2);
+    assert.equal(s.blockedTurn, true);
+  };
+  const kinds: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    blockedAgain();
+    const plan = planIntent({ kind: "search" }, hidden, LIMITS, s);
+    assert.ok(plan.ok && plan.unstick);
+    kinds.push(plan.action.kind === "rotate" ? `rotate ${plan.action.degrees}` : plan.action.kind);
+    recordAction(s, hidden, plan.action, plan, LIMITS);
+    if (plan.action.kind === "rotate") applyImuYaw(s, (s.imuYawDeg ?? 0) + plan.action.degrees);
+  }
+  assert.deepEqual(kinds, ["advance", "rotate 45", "advance", "backup", "rotate 45"]);
+  assert.equal(s.direction, 1); // the rest of the turn goes the other way, whatever the model asks
+  const after = searchWith({ unsticks: 1, direction: 1 });
+  assert.deepEqual(planIntent({ kind: "search", direction: -1 }, hidden, LIMITS, after), { ok: true, action: { kind: "rotate", degrees: 45 } });
+  blockedAgain();
+  const stop = planIntent({ kind: "search" }, hidden, LIMITS, s);
+  assert.ok(stop.ok && stop.action.kind === "finish" && !stop.action.success);
+  // Without room ahead the forward step is a back-up; a turn that mostly happened is not blocked;
+  // the model cannot ask to back up.
+  const t = searchWith({ blockedTurn: true, blockedTurnDeg: -90, unsticks: 0 });
+  const wall = obs({ target: { visible: false, source: "vlm" }, front_clearance_m: 0.5 });
+  const step = planIntent({ kind: "search" }, wall, LIMITS, t);
+  assert.ok(step.ok && step.action.kind === "backup");
+  const u = newSearchState(-1);
+  applyImuYaw(u, 0);
+  recordAction(u, hidden, { kind: "rotate", degrees: -90 }, null, LIMITS);
+  applyImuYaw(u, -60);
+  assert.equal(u.blockedTurn, false);
+  assert.equal(planIntent({ kind: "backup", meters: 0.3 }, hidden, LIMITS, u).ok, false);
 });

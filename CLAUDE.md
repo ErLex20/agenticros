@@ -18,22 +18,22 @@ The parent repo's `CLAUDE.md` covers the container, the simulation and the end-t
 
 ## Nebius adapter (`packages/agenticros-nebius/src/`)
 
-Launched by the parent's `scripts/run_nebius_agent.sh`, which loads `.env` and sets the simulation defaults. It spawns the Claude Code MCP server (`../agenticros-claude-code/dist/index.js`) as a stdio child and reaches the robot **only** through its tools (`ros2_camera_snapshot`, `ros2_depth_distance`, `ros2_move_for`, `ros2_estop`), so the AgenticROS safety clamps always apply.
+Launched by the parent's `scripts/run_nebius_agent.sh`, which loads `.env` and sets the simulation defaults. It spawns the Claude Code MCP server (`../agenticros-claude-code/dist/index.js`) as a stdio child and reaches the robot **only** through its tools (`ros2_camera_snapshot`, `ros2_depth_distance`, `ros2_depth_corridor`, `ros2_imu_yaw`, `ros2_move_for`, `ros2_estop`), so the AgenticROS safety clamps always apply.
 
 | File | Purpose |
 |------|---------|
 | `index.ts` | Entry point: env parsing (`NEBIUS_*`), MCP client spawn, always `ros2_estop` on exit |
 | `agent.ts` | `GoalAgent`: observe → decide → act loop with Nemotron tool calls, bounded by steps, time and a full search turn; without a map, after each full turn without the target it can ask the vision model where to explore (`suggestExploration`, opt-in with `NEBIUS_EXPLORE_CHOICE=vision`, box models only; default `open`: confirmed doorways, then the most open direction). A camera snapshot timeout is a missed observation (no motion), not the end of the task |
-| `perception.ts` | Target localization by the vision model (default `NEBIUS_PERCEPTION=vlm`; `yolo` adds tiled YOLO for COCO targets). The vision model returns a bounding box (Kimi-K2.6, default) or a numbered column (MiniCPM-V), per its profile; crop checks of attributes and of vision-model sightings at confirmation and arrival; `chooseExploreView`: the views of a search turn in one mosaic, the model returns the view and the point to walk toward |
+| `perception.ts` | Target localization by the vision model (default `NEBIUS_PERCEPTION=vlm`; `yolo` adds tiled YOLO for COCO targets). The vision model returns a bounding box (Kimi-K2.6, default) or a numbered column (MiniCPM-V), per its profile; crop checks of attributes and of vision-model sightings at confirmation and arrival (the model names the object before the verdict, `VERIFY_SCHEMA`); `chooseExploreView`: the views of a search turn in one mosaic, the model returns the view and the point to walk toward |
 | `vision.ts` | Pure helpers: per-model vision profiles (grounding, image width, provider fields such as disabling Kimi's thinking), robust JSON extraction, box normalization, reply schema |
-| `policy.ts` | Pure helpers (camera geometry, intent → bounded motion, goal test, deterministic fallback, search and exploration state). The no-map graph lives here: dead-reckoned position (`xM`, `yM`), places where the robot searched a full turn with their explored headings (`enterPlace`), and `suggestedHeadingDeg`, which `chooseExploreHeading` prefers. Also the `detour` around an obstacle between the robot and a confirmed target: when two motions in a row leave the target where it was in the image (stuck: turn away from the target's side) or when there is no room to advance toward it (blocked: the target's side first, then the other), turn 40° and walk up to 0.7 m; at most 3 per spot. No ROS, no network |
-| `robot.ts` | Thin wrappers around the MCP tools; turn/forward efficiency compensation for the legged base |
+| `policy.ts` | Pure helpers (camera geometry, intent → bounded motion, goal test, deterministic fallback, search and exploration state). The no-map graph lives here: dead-reckoned position (`xM`, `yM`), places where the robot searched a full turn with their explored headings (`enterPlace`), and `suggestedHeadingDeg`, which `chooseExploreHeading` prefers. Also the `detour` around an obstacle between the robot and a confirmed target: when two motions in a row leave the target where it was in the image (stuck: turn away from the target's side) or when there is no room to advance toward it (blocked: the target's side first, then the other), turn 40° and walk up to 0.7 m; at most 3 per spot. With an IMU (`NEBIUS_IMU_TOPIC`) `applyImuYaw` replaces the commanded turns with the measured one in the heading and the searched angle, and a rotation that turns less than half the command (`blockedTurn`) starts the `UNSTICK_STEPS` (step forward, turn the other way, forward, back, other way; then finish as stuck), with the controller picking the search direction from then on. No ROS, no network |
+| `robot.ts` | Thin wrappers around the MCP tools; turn/forward efficiency compensation for the legged base; `imuYaw` (gyroscope heading), `depthCorridor` (obstacles lower than the camera, combined with the band above the horizon in `agent.ts`, `NEBIUS_DEPTH_CORRIDOR=off` disables it), `backUp` |
 | `__tests__/policy.test.ts`, `__tests__/vision.test.ts` | Offline unit tests for `policy.ts` and `vision.ts` |
 
 Rules:
 - Keep geometry and safety decisions in deterministic code (`policy.ts`). The LLM picks semantic intents (`search` / `face_target` / `approach_target` / `finish`); the controller bounds, clamps or rejects them.
 - The model never sees ground-truth pose. `AGENTICROS_DEBUG_POSE_TOPIC` is logging-only diagnostics.
-- Logs go to stderr (`[Goal]`, `[Step N]`, `[Scene]`, `[Decision]`, `[Explore]`, `[Graph]`, `[Timing]`); stdout carries only the final answer in Italian.
+- Logs go to stderr (`[Goal]`, `[Step N]`, `[Scene]`, `[Decision]`, `[Explore]`, `[Graph]`, `[Heading]`, `[Timing]`); stdout carries only the final answer in Italian.
 - Never print or log `NEBIUS_API_KEY`.
 - Every vision-model call goes through `Perception.ask()`, which applies the model profile from `vision.ts` (e.g. Kimi-K2.6 thinks by default and needs `chat_template_kwargs: {thinking: false}`). A new vision model needs a profile there and a measurement with the parent's `scripts/vision_eval/` before becoming the default.
 - Geometry rules depend on `TargetObservation.localization` (`box` = tight box from YOLO or a grounding model, `column` = coarse band), not on `source`. `source` only drives trust (YOLO ≥ 0.8 confirmed at once, everything else needs two consecutive frames).
@@ -83,7 +83,8 @@ ros2_ws/src/
 | `tools.ts` | Tool definitions + handlers (`ros2_move_for`, `ros2_camera_snapshot`, `ros2_depth_distance`, `ros2_estop`, …) |
 | `config.ts` | Config loading (env / `AGENTICROS_CONFIG_PATH` / `~/.agenticros/config.json`) |
 | `safety.ts` | Velocity clamps applied before every publish |
-| `depth.ts` | Depth image sampling |
+| `depth.ts` | Depth image sampling; `getDepthCorridor`: nearest obstacle in a 3D corridor in front of the body (level camera, planar depth) |
+| `imu-yaw.ts` | `ros2_imu_yaw`: heading change integrated from the IMU gyroscope (angular velocity projected on the vertical with roll and pitch; the absolute yaw is never used, in simulation it is the ground truth). Subscribes with a 500-message queue: with the default 10, messages were lost while the server converted a camera frame and the heading was off by up to 27° after 720° |
 
 After editing it, rebuild with `pnpm --filter @agenticros/claude-code build`: both the MCP server and the Nebius agent run it from `dist/`.
 
@@ -91,7 +92,7 @@ After editing it, rebuild with `pnpm --filter @agenticros/claude-code build`: bo
 
 - **ESM only**, TypeScript strict, NodeNext module resolution
 - pnpm workspaces (`packages/*`), npm scope `@agenticros/`, ROS package prefix `agenticros_`
-- Every transport implements `RosTransport` from `@agenticros/core`
+- Every transport implements `RosTransport` from `@agenticros/core`. The local transport honours `SubscribeOptions.queueLength` (QoS depth) above the default 10
 - Config is validated with Zod and defaults live in the schema; never assume a field is set
 - Shared ML or inference logic goes in a shared package (e.g. `object-detection`), not in per-adapter copies
 

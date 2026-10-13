@@ -61,6 +61,8 @@ export interface RobotOptions {
   turnEfficiency: number;
   /** Fraction of the commanded forward distance the base actually achieves. */
   forwardEfficiency: number;
+  /** sensor_msgs/Imu topic whose gyroscope measures the heading change (ros2_imu_yaw); unset: commanded turns. */
+  imuTopic?: string;
 }
 
 export interface Snapshot {
@@ -95,6 +97,48 @@ export class RobotTools {
     const image = content.find((c) => c.type === "image" && typeof c.data === "string");
     if (isError || !image?.data) throw new Error(`Camera snapshot failed: ${text || "no image returned"}`);
     return { image: Buffer.from(image.data, "base64"), mimeType: image.mimeType ?? "image/png" };
+  }
+
+  /**
+   * Nearest obstacle in a 3D corridor in front of the body (ros2_depth_corridor), also below the
+   * camera; distance null when clear. Null when unavailable.
+   */
+  async depthCorridor(geometry: { cameraHeightM: number; hfovDeg: number; halfWidthM: number }): Promise<{ distance: number | null } | null> {
+    if (!this.opts.depthTopic) return null;
+    const { text, isError } = await this.call("ros2_depth_corridor", {
+      topic: this.opts.depthTopic,
+      camera_height_m: geometry.cameraHeightM,
+      hfov_deg: geometry.hfovDeg,
+      half_width_m: geometry.halfWidthM,
+    });
+    if (isError) return null;
+    const json = text.split("\n").reverse().find((line) => line.trim().startsWith("{"));
+    if (!json) return null;
+    try {
+      const parsed = JSON.parse(json) as { valid?: boolean; distance_m?: number | null };
+      if (!parsed.valid) return null;
+      return { distance: typeof parsed.distance_m === "number" ? parsed.distance_m : null };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Heading change integrated from the IMU gyroscope by the MCP server since its first reading
+   * (deg, counter-clockwise positive, unwrapped); null without an IMU topic or recent data.
+   */
+  async imuYaw(): Promise<{ yawDeg: number; skippedS: number } | null> {
+    if (!this.opts.imuTopic) return null;
+    const { text, isError } = await this.call("ros2_imu_yaw", { topic: this.opts.imuTopic });
+    if (isError) return null;
+    const json = text.split("\n").reverse().find((line) => line.trim().startsWith("{"));
+    if (!json) return null;
+    try {
+      const parsed = JSON.parse(json) as { valid?: boolean; yaw_deg?: number; skipped_s?: number };
+      return parsed.valid && typeof parsed.yaw_deg === "number" ? { yawDeg: parsed.yaw_deg, skippedS: parsed.skipped_s ?? 0 } : null;
+    } catch {
+      return null;
+    }
   }
 
   /** Near-surface distance (12th percentile) inside a normalized image region; null when unavailable. */
@@ -145,6 +189,12 @@ export class RobotTools {
   async advance(meters: number): Promise<void> {
     const seconds = meters / (this.opts.maxLinear * this.opts.forwardEfficiency);
     await this.moveChunks(this.opts.maxLinear, 0, seconds);
+  }
+
+  /** Walk backwards (no rear sensing: short distances only, to free the body). */
+  async backUp(meters: number): Promise<void> {
+    const seconds = meters / (this.opts.maxLinear * this.opts.forwardEfficiency);
+    await this.moveChunks(-this.opts.maxLinear, 0, seconds);
   }
 
   /** Named places of the map; empty when none are configured (AGENTICROS_PLACES_PATH). */

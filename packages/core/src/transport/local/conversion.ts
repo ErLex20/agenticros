@@ -17,7 +17,7 @@ const typeCache = new Map<string, any>();
  * Resolve the rclnodejs module. Uses createRequire because rclnodejs is CJS.
  * Returns `any` — rclnodejs is an optional dependency and types may not be present.
  */
-function getRclnodejs(): any {
+export function getRclnodejs(): any {
   return require("rclnodejs");
 }
 

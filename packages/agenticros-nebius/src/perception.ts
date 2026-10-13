@@ -69,6 +69,19 @@ export interface ExploreChoice {
   reason: string;
 }
 
+/**
+ * Crop check reply: the object is named before the verdict. Asked for the verdict first, the
+ * model confirmed 46 of 131 look-alike crops of the house (34 of 49 tables as a desk); naming
+ * it first, with parts of the target accepted, 19 of 131, at 35 of 45 targets against 38
+ * (parent scripts/vision_eval/verify_eval.py). A sofa still passes for a bed about 1 time in 3.
+ */
+const VERIFY_SCHEMA = {
+  type: "object",
+  properties: { object: { type: "string" }, reason: { type: "string" }, match: { type: "boolean" } },
+  required: ["object", "reason", "match"],
+  additionalProperties: false,
+};
+
 const EXPLORE_TILE_W = 768;
 const EXPLORE_TILE_H = 432;
 const EXPLORE_SCHEMA = {
@@ -223,21 +236,24 @@ export class Perception {
             {
               type: "text",
               text:
-                `Is the main object in this crop a ${target.description}` +
-                (target.attributes.length > 0 ? ` (attributes to check: ${target.attributes.join(", ")})` : "") +
-                "? A similar object is not a match (a sofa is not a bed, a cabinet is not a refrigerator). " +
-                'Return JSON only: {"match": boolean, "reason": string}',
+                "Name the main object in this crop with its most specific common name, then say whether it is a " +
+                `${target.description} or a part of one (a mattress is part of a bed)` +
+                (target.attributes.length > 0 ? `, with these attributes: ${target.attributes.join(", ")}` : "") +
+                ". A similar object is not a match (a sofa is not a bed, a coffee table is not a desk, a cabinet is not a refrigerator). " +
+                'Return JSON: {"object": string, "reason": string, "match": boolean}',
             },
             { type: "image_url", image_url: { url: `data:image/jpeg;base64,${crop.toString("base64")}` } },
           ],
         },
       ],
-      120,
+      200,
+      VERIFY_SCHEMA,
     );
     const parsed = parseJsonObject(content);
     const match = parsed?.["match"] === true;
     process.stderr.write(
-      `[Verify] ${target.description} (${candidate.source}${candidate.confidence != null ? ` ${candidate.confidence}` : ""}): ${match ? "match" : "no match"} ${String(parsed?.["reason"] ?? "")}\n`,
+      `[Verify] ${target.description} (${candidate.source}${candidate.confidence != null ? ` ${candidate.confidence}` : ""}): ${match ? "match" : "no match"} ` +
+        `(${String(parsed?.["object"] ?? "?")}) ${String(parsed?.["reason"] ?? "")}\n`,
     );
     // Forced checks of vision-model sightings must not stand in for YOLO candidates later.
     if (match && !force) this.verifiedOnce = true;

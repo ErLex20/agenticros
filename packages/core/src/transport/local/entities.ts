@@ -7,7 +7,7 @@
  */
 
 import type { Subscription } from "../types.js";
-import { loadMessageClass, fromRosMessage } from "./conversion.js";
+import { getRclnodejs, loadMessageClass, fromRosMessage } from "./conversion.js";
 
 type Node = any;
 type MessageHandler = (msg: Record<string, unknown>) => void;
@@ -40,6 +40,7 @@ export class EntityCache {
     topic: string,
     typeStr: string,
     handler: MessageHandler,
+    queueLength?: number,
   ): Subscription {
     const key = `${topic}::${typeStr}`;
     let entry = this.subscriptions.get(key);
@@ -47,10 +48,24 @@ export class EntityCache {
     if (!entry) {
       const MessageClass = loadMessageClass(typeStr);
       const handlers = new Set<MessageHandler>();
+      // The default QoS keeps the last 10 messages: a high-rate stream loses messages whenever
+      // the JS thread is busy for longer than 10 periods. A longer queue keeps them.
+      const rcl = queueLength && queueLength > 10 ? getRclnodejs() : null;
+      const options = rcl
+        ? {
+            qos: new rcl.QoS(
+              rcl.QoS.HistoryPolicy.RMW_QOS_POLICY_HISTORY_KEEP_LAST,
+              Math.floor(queueLength!),
+              rcl.QoS.ReliabilityPolicy.RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+              rcl.QoS.DurabilityPolicy.RMW_QOS_POLICY_DURABILITY_VOLATILE,
+            ),
+          }
+        : undefined;
 
       const handle = node.createSubscription(
         MessageClass,
         topic,
+        options,
         (msg: any) => {
           if (handlers.size === 0) return;
           const plain = fromRosMessage(msg, typeStr);

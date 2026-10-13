@@ -89,7 +89,13 @@ async function main(): Promise<void> {
     maxAngular: envPositive("NEBIUS_MAX_ANGULAR", 0.5),
     turnEfficiency: envPositive("NEBIUS_TURN_EFFICIENCY", 1.0, 2),
     forwardEfficiency: envPositive("NEBIUS_FORWARD_EFFICIENCY", 1.0, 2),
+    imuTopic: envString("NEBIUS_IMU_TOPIC"),
   });
+  process.stderr.write(
+    robot.opts.imuTopic
+      ? `[Heading] IMU gyroscope on ${robot.opts.imuTopic}\n`
+      : "[Heading] NEBIUS_IMU_TOPIC not set: the heading is the sum of the commanded turns\n",
+  );
   if (!robot.opts.depthTopic) {
     process.stderr.write(
       "[AgenticROS] NEBIUS_DEPTH_TOPIC not set: no obstacle or target distance; advances are limited to short creeps\n",
@@ -113,6 +119,8 @@ async function main(): Promise<void> {
   const requestedChoice = envChoice("NEBIUS_EXPLORE_CHOICE", ["vision", "open"] as const) ?? "open";
   const exploreChoice = requestedChoice === "vision" && vision.grounding !== "box" ? "open" : requestedChoice;
   process.stderr.write(`[Explore] choice=${exploreChoice}\n`);
+  // Obstacles lower than the camera, from a 3D corridor of the depth image (NEBIUS_DEPTH_CORRIDOR=off: band only).
+  const depthCorridor = (envChoice("NEBIUS_DEPTH_CORRIDOR", ["on", "off"] as const) ?? "on") === "on" && !!robot.opts.depthTopic;
   const hfovDeg = envPositive("NEBIUS_CAMERA_HFOV_DEG", 110, 179);
   const perception = new Perception(api, {
     vision,
@@ -128,6 +136,7 @@ async function main(): Promise<void> {
     policy: envString("NEBIUS_POLICY") === "auto" ? "auto" : "llm",
     perception: perceptionMode,
     exploreChoice,
+    depthCorridor,
     camera: {
       heightM: envPositive("NEBIUS_CAMERA_HEIGHT_M", 0.385, 3),
       hfovDeg,
