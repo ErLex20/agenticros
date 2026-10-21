@@ -52,6 +52,15 @@ def test_pick_frontier_prefers_nearest():
     assert picked.x == 1.0
 
 
+def test_pick_frontier_skips_frontiers_too_close():
+    robot = Pose2D(0.0, 0.0)
+    near = Pose2D(0.4, 0.0)
+    far = Pose2D(3.0, 0.0)
+    picked = pick_frontier([near, far], robot, recent=[], min_distance_m=1.0)
+    assert picked is not None and picked.x == 3.0
+    assert pick_frontier([near], robot, recent=[], min_distance_m=1.0) is None
+
+
 def test_pick_wander_respects_min_separation():
     robot = Pose2D(x=0.5, y=0.5)
     cells = [Pose2D(x=0.6, y=0.6), Pose2D(x=3.0, y=3.0)]

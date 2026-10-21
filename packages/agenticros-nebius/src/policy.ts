@@ -727,6 +727,49 @@ function blockedAhead(obs: Observation, limits: PolicyLimits): boolean {
 
 /** Deterministic fallback used when the reasoning model gives no usable intent. */
 /** Confident YOLO sightings are trusted at once; weaker ones only when seen in two consecutive frames. */
+/**
+ * Nav2 approach: below this many meters left to the stop distance the approach stays visual
+ * (timed advances re-checked on every frame); above it one Nav2 trip covers most of the way.
+ */
+export const NAV2_APPROACH_MIN_M = 1.5;
+/** A Nav2 approach stops this much short of the stop distance; the visual approach finishes. */
+export const NAV2_APPROACH_MARGIN_M = 0.5;
+
+/** Estimated pose of the robot in the map frame (yaw in rad, counter-clockwise). */
+export interface MapPose2D {
+  x: number;
+  y: number;
+  yaw: number;
+}
+
+/**
+ * Nav2 goal for a confirmed target far ahead: on the line from the robot to the target, short of
+ * it by the stop distance plus NAV2_APPROACH_MARGIN_M, facing it. Moving the base along that line
+ * shortens the camera-to-target distance by the same amount, so the camera offset cancels out.
+ * Null when the approach should stay visual: target not tightly localized (box), distance unknown
+ * or occluded, off-axis, or already within NAV2_APPROACH_MIN_M of the stop distance.
+ */
+export function nav2ApproachGoal(
+  pose: MapPose2D,
+  obs: Observation,
+  limits: PolicyLimits,
+): { x: number; y: number; yaw: number; meters: number } | null {
+  const t = obs.target;
+  if (!t?.visible || (t.localization ?? "box") !== "box" || t.occluded) return null;
+  if (typeof t.distance_m !== "number" || !Number.isFinite(t.distance_m)) return null;
+  const bearing = t.bearing_deg ?? 0;
+  if (Math.abs(bearing) > limits.alignToleranceDeg) return null;
+  const meters = t.distance_m - limits.stopDistanceM - NAV2_APPROACH_MARGIN_M;
+  if (meters < NAV2_APPROACH_MIN_M - NAV2_APPROACH_MARGIN_M) return null;
+  const dir = pose.yaw + (bearing * Math.PI) / 180;
+  return {
+    x: round(pose.x + meters * Math.cos(dir), 3),
+    y: round(pose.y + meters * Math.sin(dir), 3),
+    yaw: round(Math.atan2(Math.sin(dir), Math.cos(dir)), 4),
+    meters: round(meters, 2),
+  };
+}
+
 export function sightingConfirmed(obs: Observation, search: SearchState, limits: PolicyLimits): boolean {
   const t = obs.target;
   if (!t?.visible) return false;

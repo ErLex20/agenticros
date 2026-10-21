@@ -229,8 +229,10 @@ export {
   savePlaceFromArgs,
   findNavigateToCapability,
   executeNavigateToPlace,
+  executeNavigateToPose,
   cancelNavigation,
 } from "./places-runtime.js";
+export type { MapPose } from "./places-runtime.js";
 
 export {
   listRobots,

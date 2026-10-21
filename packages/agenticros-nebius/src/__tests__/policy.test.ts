@@ -10,6 +10,7 @@ import {
   chooseExploreHeading,
   enterPlace,
   maxSafeAdvance,
+  nav2ApproachGoal,
   newSearchState,
   planIntent,
   recordAction,
@@ -686,4 +687,30 @@ test("a rotation the IMU finds blocked starts a sequence of ways out, then the r
   applyImuYaw(u, -60);
   assert.equal(u.blockedTurn, false);
   assert.equal(planIntent({ kind: "backup", meters: 0.3 }, hidden, LIMITS, u).ok, false);
+});
+
+test("nav2ApproachGoal: far confirmed target -> goal on the line, short of the stop distance", () => {
+  const o = visibleAt(10, 6);
+  const goal = nav2ApproachGoal({ x: 1, y: 2, yaw: Math.PI / 2 }, o, LIMITS);
+  assert.ok(goal);
+  // 6 m - 1 m stop - 0.5 m margin = 4.5 m toward yaw 90 + 10 deg
+  assert.equal(goal.meters, 4.5);
+  const dir = Math.PI / 2 + (10 * Math.PI) / 180;
+  assert.ok(Math.abs(goal.x - (1 + 4.5 * Math.cos(dir))) < 1e-3);
+  assert.ok(Math.abs(goal.y - (2 + 4.5 * Math.sin(dir))) < 1e-3);
+  assert.ok(Math.abs(goal.yaw - dir) < 1e-3);
+});
+
+test("nav2ApproachGoal: the approach stays visual near, off-axis, occluded or without distance", () => {
+  const pose = { x: 0, y: 0, yaw: 0 };
+  assert.equal(nav2ApproachGoal(pose, visibleAt(0, 2.2), LIMITS), null);
+  assert.equal(nav2ApproachGoal(pose, visibleAt(30, 6), LIMITS), null);
+  assert.equal(nav2ApproachGoal(pose, visibleAt(0, null), LIMITS), null);
+  const occluded = visibleAt(0, 6);
+  occluded.target!.occluded = true;
+  assert.equal(nav2ApproachGoal(pose, occluded, LIMITS), null);
+  const column = visibleAt(0, 6);
+  column.target!.localization = "column";
+  assert.equal(nav2ApproachGoal(pose, column, LIMITS), null);
+  assert.ok(nav2ApproachGoal(pose, visibleAt(0, 2.5), LIMITS));
 });

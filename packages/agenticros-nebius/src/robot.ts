@@ -42,8 +42,8 @@ export interface NavigationCapabilities {
   explore: boolean;
 }
 
-/** ROS action of agenticros_explore (go2_sim.launch.py nav:=slam). */
-const EXPLORE_ACTION = "/explore";
+/** Default ROS action of agenticros_explore (go2_sim.launch.py nav:=slam, go2_real_nav.launch.py). */
+export const DEFAULT_EXPLORE_ACTION = "/explore";
 const EXPLORE_ACTION_TYPE = "agenticros_msgs/action/Explore";
 /** Extra ros2_list_actions calls when Nav2 is missing; each waits for the graph to settle again. */
 const NAV_DISCOVERY_RETRIES = 2;
@@ -63,11 +63,37 @@ export interface RobotOptions {
   forwardEfficiency: number;
   /** sensor_msgs/Imu topic whose gyroscope measures the heading change (ros2_imu_yaw); unset: commanded turns. */
   imuTopic?: string;
+  /** Action of agenticros_explore (NEBIUS_EXPLORE_ACTION, default /explore). */
+  exploreAction?: string;
+}
+
+/** Estimated pose of the robot (ros2_robot_pose): localization, never the simulator ground truth. */
+export interface RobotPose {
+  x: number;
+  y: number;
+  /** rad, counter-clockwise */
+  yaw: number;
+  frame: string;
 }
 
 export interface Snapshot {
   image: Buffer;
   mimeType: string;
+}
+
+/** Outcome of a Nav2 tool call: the status field of its JSON reply, else succeeded/failed. */
+function navigationResult(text: string, isError: boolean): NavigationResult {
+  let status = isError ? "failed" : "succeeded";
+  const json = text.split("\n").reverse().find((line) => line.trim().startsWith("{"));
+  if (json) {
+    try {
+      const parsed = JSON.parse(json) as { status?: unknown };
+      if (typeof parsed.status === "string") status = parsed.status;
+    } catch {
+      // keep the status derived from isError
+    }
+  }
+  return { ok: !isError && status === "succeeded", status, text };
 }
 
 export class RobotTools {
@@ -197,6 +223,12 @@ export class RobotTools {
     await this.moveChunks(-this.opts.maxLinear, 0, seconds);
   }
 
+  /** Save the current pose estimate as a named place (ros2_save_place, AGENTICROS_PLACES_PATH). */
+  async savePlace(name: string, description: string): Promise<{ ok: boolean; text: string }> {
+    const { text, isError } = await this.call("ros2_save_place", { name, description });
+    return { ok: !isError, text };
+  }
+
   /** Named places of the map; empty when none are configured (AGENTICROS_PLACES_PATH). */
   async listPlaces(): Promise<Place[]> {
     const { text, isError } = await this.call("ros2_list_places", {});
@@ -237,7 +269,7 @@ export class RobotTools {
       const names = ((JSON.parse(text) as { actions?: { name?: string }[] }).actions ?? []).map((a) => a.name ?? "");
       return {
         navigate: names.some((n) => n.endsWith("/navigate_to_pose")),
-        explore: names.some((n) => n === EXPLORE_ACTION),
+        explore: names.some((n) => n === this.exploreAction),
       };
     } catch {
       return none;
@@ -254,7 +286,7 @@ export class RobotTools {
     const { text, isError } = await this.call(
       "ros2_action_goal",
       {
-        action: EXPLORE_ACTION,
+        action: this.exploreAction,
         actionType: EXPLORE_ACTION_TYPE,
         goal: { mode: "explore", timeout_s: timeoutS, min_frontier_m: 0.5, max_goals: 1 },
       },
@@ -280,17 +312,39 @@ export class RobotTools {
   async navigateToPlace(name: string): Promise<NavigationResult> {
     if (this.aborted) throw new Error("motion aborted");
     const { text, isError } = await this.call("ros2_navigate_to_place", { name }, NAVIGATION_TIMEOUT_MS);
-    let status = isError ? "failed" : "succeeded";
-    const json = text.split("\n").reverse().find((line) => line.trim().startsWith("{"));
-    if (json) {
-      try {
-        const parsed = JSON.parse(json) as { status?: unknown };
-        if (typeof parsed.status === "string") status = parsed.status;
-      } catch {
-        // keep the status derived from isError
-      }
+    return navigationResult(text, isError);
+  }
+
+  private get exploreAction(): string {
+    return this.opts.exploreAction || DEFAULT_EXPLORE_ACTION;
+  }
+
+  /** Estimated pose in the map frame; null without a localization topic or a recent message. */
+  async robotPose(): Promise<RobotPose | null> {
+    const { text, isError } = await this.call("ros2_robot_pose", {});
+    if (isError) return null;
+    try {
+      const p = JSON.parse(text) as { valid?: boolean; x?: number; y?: number; yaw?: number; frame?: string };
+      return p.valid && Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.yaw)
+        ? { x: p.x!, y: p.y!, yaw: p.yaw!, frame: p.frame ?? "map" }
+        : null;
+    } catch {
+      return null;
     }
-    return { ok: !isError && status === "succeeded", status, text };
+  }
+
+  /**
+   * Drive to a pose with Nav2 (ros2_navigate_to_pose, the navigate_to capability). Planning,
+   * obstacle avoidance and speed limits are Nav2's; ros2_estop cancels it.
+   */
+  async navigateToPose(pose: { x: number; y: number; yaw: number; frame?: string }, timeoutMs = NAVIGATION_TIMEOUT_MS): Promise<NavigationResult> {
+    if (this.aborted) throw new Error("motion aborted");
+    const { text, isError } = await this.call(
+      "ros2_navigate_to_pose",
+      { x: pose.x, y: pose.y, yaw: pose.yaw, frame_id: pose.frame ?? "map" },
+      timeoutMs,
+    );
+    return navigationResult(text, isError);
   }
 
   async estop(): Promise<void> {

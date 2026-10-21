@@ -38,6 +38,8 @@ import {
   listPlaces,
   savePlaceFromArgs,
   executeNavigateToPlace,
+  executeNavigateToPose,
+  readCurrentMapPose,
   cancelNavigation,
 } from "@agenticros/core";
 import { getMissionRegistry } from "./mission-registry.js";
@@ -624,6 +626,35 @@ export const TOOLS: McpTool[] = [
         robot_id: { type: "string", description: "Optional robot id (from ros2_list_robots) to scope this call. When omitted, the active robot is used." },
       },
       required: ["name"],
+    },
+  },
+  {
+    name: "ros2_robot_pose",
+    description:
+      "Estimated pose of the robot in the map frame (x, y in m, yaw in rad counter-clockwise) from the " +
+      "localization: AGENTICROS_POSE_TOPIC (nav_msgs/Odometry, e.g. the EKF), else /amcl_pose or /pose.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        robot_id: { type: "string", description: "Optional robot id (from ros2_list_robots) to scope this call. When omitted, the active robot is used." },
+      },
+    },
+  },
+  {
+    name: "ros2_navigate_to_pose",
+    description:
+      "Navigate to a pose of the map with Nav2 (navigate_to capability): global plan, obstacle avoidance and " +
+      "Nav2 speed limits. Blocks until Nav2 succeeds, aborts or ros2_estop cancels it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "x [m] in frame_id." },
+        y: { type: "number", description: "y [m] in frame_id." },
+        yaw: { type: "number", description: "Final heading [rad], counter-clockwise (default 0)." },
+        frame_id: { type: "string", description: "Frame of the pose (default map)." },
+        robot_id: { type: "string", description: "Optional robot id (from ros2_list_robots) to scope this call. When omitted, the active robot is used." },
+      },
+      required: ["x", "y"],
     },
   },
   {
@@ -1880,6 +1911,29 @@ export async function handleToolCall(
           isError: true,
         };
       }
+    }
+
+    case "ros2_robot_pose": {
+      const pose = await readCurrentMapPose(transport, robot.namespace);
+      return {
+        content: [{ type: "text", text: JSON.stringify(pose ? { valid: true, ...pose } : { valid: false }) }],
+      };
+    }
+
+    case "ros2_navigate_to_pose": {
+      const nav = await executeNavigateToPose(
+        config,
+        robot,
+        {
+          x: Number(args["x"]),
+          y: Number(args["y"]),
+          yaw: args["yaw"] != null ? Number(args["yaw"]) : undefined,
+          frame_id: typeof args["frame_id"] === "string" ? args["frame_id"] : undefined,
+        },
+        transport,
+        opts?.signal,
+      );
+      return { content: [{ type: "text", text: nav.text }], isError: nav.isError };
     }
 
     case "ros2_navigate_to_place": {

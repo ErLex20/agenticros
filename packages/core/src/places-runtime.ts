@@ -16,14 +16,35 @@ const POSE_CANDIDATES = [
   { topic: "/pose", type: "geometry_msgs/msg/PoseWithCovarianceStamped" },
 ];
 
+/**
+ * Pose topics tried in order: AGENTICROS_POSE_TOPIC first when set (type
+ * AGENTICROS_POSE_TYPE, default nav_msgs/msg/Odometry, e.g. the EKF of a robot
+ * without AMCL), then the AMCL ones.
+ */
+function poseCandidates(): { topic: string; type: string }[] {
+  const topic = process.env.AGENTICROS_POSE_TOPIC?.trim();
+  if (!topic) return POSE_CANDIDATES;
+  const type = process.env.AGENTICROS_POSE_TYPE?.trim() || "nav_msgs/msg/Odometry";
+  return [{ topic, type }, ...POSE_CANDIDATES];
+}
+
+/** A localization pose in its frame (header.frame_id, "map" when missing). */
+export interface MapPose {
+  x: number;
+  y: number;
+  yaw: number;
+  frame: string;
+  topic: string;
+}
+
 export async function readCurrentMapPose(
   transport: RosTransport,
   namespace = "",
   timeoutMs = 2500,
-): Promise<{ x: number; y: number; yaw: number } | undefined> {
-  for (const cand of POSE_CANDIDATES) {
+): Promise<MapPose | undefined> {
+  for (const cand of poseCandidates()) {
     const topic = toNamespacedTopicFull(namespace, cand.topic);
-    const pose = await new Promise<{ x: number; y: number; yaw: number } | undefined>((resolve) => {
+    const pose = await new Promise<MapPose | undefined>((resolve) => {
       const timer = setTimeout(() => {
         try {
           sub.unsubscribe();
@@ -39,7 +60,10 @@ export async function readCurrentMapPose(
         } catch {
           /* ignore */
         }
-        resolve(poseFromLocalizationMessage(msg));
+        const p = poseFromLocalizationMessage(msg);
+        const header = (msg as { header?: { frame_id?: unknown } } | undefined)?.header;
+        const frame = typeof header?.frame_id === "string" && header.frame_id ? header.frame_id : "map";
+        resolve(p ? { ...p, frame, topic } : undefined);
       });
     });
     if (pose) return pose;
@@ -56,6 +80,7 @@ export async function savePlaceFromArgs(
   let x = typeof args["x"] === "number" ? args["x"] : Number.NaN;
   let y = typeof args["y"] === "number" ? args["y"] : Number.NaN;
   let yaw = typeof args["yaw"] === "number" ? args["yaw"] : 0;
+  let frame = typeof args["frame"] === "string" ? args["frame"] : "map";
   if (!Number.isFinite(x) || !Number.isFinite(y)) {
     if (!opts.transport) {
       throw new Error("Pass x and y, or connect to ROS so the current localization pose can be read.");
@@ -63,19 +88,20 @@ export async function savePlaceFromArgs(
     const pose = await readCurrentMapPose(opts.transport, opts.robot.namespace);
     if (!pose) {
       throw new Error(
-        "Could not read /amcl_pose (or /pose). Pass x and y, or localize first (AMCL / RTAB-Map).",
+        "Could not read AGENTICROS_POSE_TOPIC, /amcl_pose or /pose. Pass x and y, or localize first (EKF / AMCL / RTAB-Map).",
       );
     }
     x = pose.x;
     y = pose.y;
     yaw = Number.isFinite(args["yaw"] as number) ? (args["yaw"] as number) : pose.yaw;
+    if (typeof args["frame"] !== "string") frame = pose.frame;
   }
   return savePlace({
     name,
     x,
     y,
     yaw,
-    frame: typeof args["frame"] === "string" ? args["frame"] : "map",
+    frame,
     ...(typeof args["description"] === "string" ? { description: args["description"] } : {}),
     robot_id: opts.robot.id,
   });
@@ -83,6 +109,41 @@ export async function savePlaceFromArgs(
 
 export function findNavigateToCapability(config: AgenticROSConfig, robotId?: string): Capability | undefined {
   return listCapabilitiesForRobot(config, robotId).find((c) => c.id === "navigate_to");
+}
+
+/**
+ * Navigate to a pose with the navigate_to capability (Nav2 NavigateToPose).
+ * Planning, obstacle avoidance and speed limits are Nav2's.
+ */
+export async function executeNavigateToPose(
+  config: AgenticROSConfig,
+  robot: ResolvedRobot,
+  pose: { x: number; y: number; yaw?: number; frame_id?: string },
+  transport: RosTransport,
+  signal?: AbortSignal,
+): Promise<{ text: string; isError?: boolean }> {
+  if (!Number.isFinite(pose.x) || !Number.isFinite(pose.y)) {
+    return { text: "navigate_to_pose requires finite x and y.", isError: true };
+  }
+  const cap = findNavigateToCapability(config, robot.id);
+  if (!cap || cap.implementation?.kind !== "external_ros_node") {
+    return {
+      text:
+        "navigate_to is not installed. Add a navigate_to skill to skillPaths " +
+        "(or `agenticros skills install @agenticros/navigate-to`) and restart the agent.",
+      isError: true,
+    };
+  }
+  return executeExternalCapability(
+    cap,
+    { x: pose.x, y: pose.y, yaw: Number.isFinite(pose.yaw) ? pose.yaw : 0, frame_id: pose.frame_id ?? "map" },
+    transport,
+    {
+      namespace: robot.namespace,
+      signal,
+      workspaceCheck: resolveSafetyForRobot(config, robot),
+    },
+  );
 }
 
 export async function executeNavigateToPlace(
@@ -99,24 +160,12 @@ export async function executeNavigateToPlace(
       isError: true,
     };
   }
-  const cap = findNavigateToCapability(config, robot.id);
-  if (!cap || cap.implementation?.kind !== "external_ros_node") {
-    return {
-      text:
-        "navigate_to is not installed. Run `agenticros skills install --bundle mapping` " +
-        "(or `agenticros skills install @agenticros/navigate-to`) and restart the agent.",
-      isError: true,
-    };
-  }
-  const result = await executeExternalCapability(
-    cap,
+  const result = await executeNavigateToPose(
+    config,
+    robot,
     { x: place.x, y: place.y, yaw: place.yaw, frame_id: place.frame },
     transport,
-    {
-      namespace: robot.namespace,
-      signal,
-      workspaceCheck: resolveSafetyForRobot(config, robot),
-    },
+    signal,
   );
   return { ...result, place };
 }

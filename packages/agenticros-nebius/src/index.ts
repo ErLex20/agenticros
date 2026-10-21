@@ -90,6 +90,7 @@ async function main(): Promise<void> {
     turnEfficiency: envPositive("NEBIUS_TURN_EFFICIENCY", 1.0, 2),
     forwardEfficiency: envPositive("NEBIUS_FORWARD_EFFICIENCY", 1.0, 2),
     imuTopic: envString("NEBIUS_IMU_TOPIC"),
+    exploreAction: envString("NEBIUS_EXPLORE_ACTION"),
   });
   process.stderr.write(
     robot.opts.imuTopic
@@ -136,6 +137,9 @@ async function main(): Promise<void> {
     policy: envString("NEBIUS_POLICY") === "auto" ? "auto" : "llm",
     perception: perceptionMode,
     exploreChoice,
+    nav2Walk: (envChoice("NEBIUS_NAV2_WALK", ["on", "off"] as const) ?? "on") === "on",
+    nav2Approach: (envChoice("NEBIUS_NAV2_APPROACH", ["on", "off"] as const) ?? "on") === "on",
+    sessionPlaces: (envChoice("NEBIUS_SESSION_PLACES", ["on", "off"] as const) ?? "off") === "on",
     depthCorridor,
     camera: {
       heightM: envPositive("NEBIUS_CAMERA_HEIGHT_M", 0.385, 3),

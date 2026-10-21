@@ -69,6 +69,8 @@ class ExploreNode(Node):
         self.declare_parameter("min_frontier_m", 0.5)
         self.declare_parameter("wander_min_sep_m", 1.0)
         self.declare_parameter("map_wait_s", 15.0)
+        # Frontiers nearer than this to the robot are skipped (0: any).
+        self.declare_parameter("min_goal_distance_m", 0.0)
 
         self._map_topic = str(self.get_parameter("map_topic").value)
         self._navigate_action = str(self.get_parameter("navigate_action").value)
@@ -188,7 +190,10 @@ class ExploreNode(Node):
             min_sep = float(self.get_parameter("wander_min_sep_m").value)
             return pick_wander_pose(cells, robot, self._recent_goals, min_sep, self._wander_rng)
         frontiers = find_frontiers(data, meta, min_size_m=min_frontier)
-        return pick_frontier(frontiers, robot, self._recent_goals)
+        return pick_frontier(
+            frontiers, robot, self._recent_goals,
+            min_distance_m=float(self.get_parameter("min_goal_distance_m").value),
+        )
 
     def _send_nav_goal(self, pose: Pose2D, timeout_s: float, goal_handle: ServerGoalHandle) -> bool:
         if not self._nav_client.wait_for_server(timeout_sec=5.0):

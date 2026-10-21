@@ -153,8 +153,15 @@ def pick_frontier(
     robot: Pose2D,
     recent: Sequence[Tuple[float, float]],
     avoid_radius_m: float = 0.6,
+    min_distance_m: float = 0.0,
 ) -> Optional[Pose2D]:
-    """Nearest frontier that is not too close to a recently visited goal."""
+    """Nearest frontier that is not too close to a recently visited goal.
+
+    Frontiers closer than min_distance_m to the robot are skipped: with a lidar
+    that leaves unknown cells around the robot (blind spots, a tilted Mid-360
+    looking up behind the body) the nearest frontier is a few decimetres away
+    and the trip explores nothing.
+    """
 
     def too_recent(p: Pose2D) -> bool:
         for rx, ry in recent:
@@ -167,6 +174,8 @@ def pick_frontier(
         if too_recent(f):
             continue
         dist = ((f.x - robot.x) ** 2 + (f.y - robot.y) ** 2) ** 0.5
+        if dist < min_distance_m:
+            continue
         yaw = _heading(robot.x, robot.y, f.x, f.y)
         scored.append((dist, Pose2D(x=f.x, y=f.y, yaw=yaw)))
     if not scored:

@@ -32,10 +32,12 @@ import {
   fullTurnSearched,
   isGoalReached,
   isPhantomSighting,
+  nav2ApproachGoal,
   newSearchState,
   recordAction,
   recordObservation,
   round,
+  sightingConfirmed,
   planIntent,
   wrapDeg,
   type Action,
@@ -64,6 +66,17 @@ const MAX_EXPLICIT_MOVES = 8;
 
 /** Consecutive failed frontier trips before falling back to walking toward open space. */
 const MAX_FRONTIER_FAILURES = 2;
+
+/** A Nav2 trip that moved the robot less than this did not happen (frontier or walk). */
+const MIN_NAV2_TRIP_M = 0.3;
+/** Nav2 time budget per meter of a walk, plus a fixed allowance for planning and turning. */
+const NAV2_WALK_S_PER_M = 20;
+const NAV2_WALK_BASE_S = 30;
+
+/** Camera ahead of the base (Go2 head, ~0.33 m), for placing a sighting in the map frame. */
+const CAMERA_FORWARD_M = 0.3;
+/** A close sighting within this distance of the remembered target position is the same target. */
+const TARGET_MATCH_M = 1.5;
 
 /** Consecutive observations without a camera frame or a usable vision reply before giving up. */
 const MAX_PERCEPTION_FAILURES = 3;
@@ -102,9 +115,26 @@ export interface AgentConfig {
    * most open direction.
    */
   exploreChoice: "vision" | "open";
+  /**
+   * With Nav2 running and a pose estimate (ros2_robot_pose), the exploration walks are Nav2
+   * goals along the chosen heading instead of timed advances (NEBIUS_NAV2_WALK=off disables it).
+   */
+  nav2Walk: boolean;
+  /**
+   * With Nav2 and a pose estimate, a confirmed target farther than NAV2_APPROACH_MIN_M beyond the
+   * stop distance is approached with one Nav2 goal; the last meter stays visual
+   * (NEBIUS_NAV2_APPROACH=off disables it).
+   */
+  nav2Approach: boolean;
+  /**
+   * Named places of this localization session (NEBIUS_SESSION_PLACES=on): saved with the pose
+   * estimate ("remember this place as kitchen", and every target reached), usable with a live
+   * map too, since the map frame of EKF + LIO-SAM holds for the whole session.
+   */
+  sessionPlaces: boolean;
 }
 
-type GoalMode = "approach" | "describe" | "move" | "stop" | "goto";
+type GoalMode = "approach" | "describe" | "move" | "stop" | "goto" | "remember";
 
 interface ParsedGoal {
   mode: GoalMode;
@@ -273,6 +303,8 @@ export class GoalAgent {
   private askedTurnId = -1;
   /** Navigation stack detected at the start of the run. */
   private navigation: NavigationCapabilities = { navigate: false, explore: false };
+  /** Map position of the target from its last far sighting (with a pose estimate). */
+  private targetMap: { x: number; y: number } | null = null;
 
   constructor(
     private readonly api: OpenAI,
@@ -299,6 +331,11 @@ export class GoalAgent {
   }
 
   async parseGoal(prompt: string, places: Place[] = []): Promise<ParsedGoal> {
+    const remember = this.cfg.sessionPlaces;
+    const rememberRules = remember
+      ? "mode=remember: save where the robot is now as a named place, e.g. 'ricorda questo posto come cucina' -> " +
+        "place 'cucina' (the name the user gives, lower case). "
+      : "";
     const placeRules = places.length
       ? "The robot has a map and navigates with Nav2 to these known places: " +
         places.map((p) => `${p.name} (${p.description ?? "no description"})`).join("; ") +
@@ -313,13 +350,14 @@ export class GoalAgent {
         role: "system",
         content:
           "You translate a user's request for a quadruped robot into a JSON task. Return JSON only with this schema: " +
-          `{"mode": "approach"|"describe"|"move"|"stop"${places.length ? '|"goto"' : ""}, ` +
+          `{"mode": "approach"|"describe"|"move"|"stop"${places.length ? '|"goto"' : ""}${remember ? '|"remember"' : ""}, ` +
           '"target_description": string|null (English, e.g. "red fire hydrant"), ' +
           '"coco_class": string|null, "attributes": string[], "stop_distance_m": number|null, ' +
           '"search_direction": "left"|"right"|null, "moves": [{"rotate_deg": number} or {"advance_m": number}]' +
-          `${places.length ? ', "place": string|null' : ""}}. ` +
+          `${places.length || remember ? ', "place": string|null' : ""}}. ` +
           "mode=approach: find an object and go near it or reach it. mode=describe: only look and describe, no motion. " +
           placeRules +
+          rememberRules +
           "mode=move: explicit motions only (rotate_deg positive = left; advance_m forward). mode=stop: stop the robot. " +
           `coco_class must be exactly one of these COCO classes when the target is one of them, otherwise null: ${COCO_CLASSES.join(", ")}. ` +
           "attributes lists properties a generic detector cannot verify (colour, material, size), e.g. [\"red\"]. " +
@@ -331,13 +369,19 @@ export class GoalAgent {
     log(`[Goal] ${JSON.stringify(parsed)}`);
 
     const placeNames = new Set(places.map((p) => p.name));
-    const place = typeof parsed["place"] === "string" && placeNames.has(parsed["place"]) ? parsed["place"] : null;
-    const allowedModes = places.length
-      ? (["approach", "describe", "move", "stop", "goto"] as const)
-      : (["approach", "describe", "move", "stop"] as const);
+    const rawPlace = typeof parsed["place"] === "string" ? parsed["place"].trim() : "";
+    const allowedModes: readonly GoalMode[] = [
+      "approach", "describe", "move", "stop",
+      ...(places.length ? (["goto"] as const) : []),
+      ...(remember ? (["remember"] as const) : []),
+    ];
     const parsedMode = allowedModes.find((m) => m === parsed["mode"]);
+    if (parsedMode === "remember" && rawPlace) {
+      return { mode: "remember", target: null, place: rawPlace.toLowerCase(), stopDistanceM: null, searchDirection: -1, moves: [] };
+    }
+    const place = placeNames.has(rawPlace) ? rawPlace : null;
     // goto without a valid place falls back to the visual approach (or a description).
-    const mode = parsedMode === "goto" && !place ? "approach" : (parsedMode ?? "describe");
+    const mode = parsedMode === "goto" && !place ? "approach" : parsedMode === "remember" ? "describe" : (parsedMode ?? "describe");
     const cocoRaw = typeof parsed["coco_class"] === "string" ? parsed["coco_class"] : null;
     const cocoClass = cocoRaw && resolveCocoClassId(cocoRaw) !== null ? cocoRaw : null;
     const description = typeof parsed["target_description"] === "string" ? parsed["target_description"] : null;
@@ -554,6 +598,7 @@ export class GoalAgent {
     };
     if (limits.frontierExploration) limits.maxExplorations = Math.max(limits.maxExplorations, FRONTIER_MAX_EXPLORATIONS);
     const search: SearchState = newSearchState(parsed.searchDirection);
+    this.targetMap = null;
     const history: HistoryEntry[] = [];
     let frontierFailures = 0;
     let perceptionFailures = 0;
@@ -585,6 +630,7 @@ export class GoalAgent {
         obs.target = { visible: false, source: obs.target.source, localization: obs.target.localization ?? "box" };
       }
       await this.checkVisionSighting(obs, parsed.target, search, limits);
+      await this.rememberTarget(obs, search, limits);
       log(`[Step ${step}] ${summarizeObservation(obs)}`);
       log(`[Scene] ${obs.scene}`);
       recordObservation(search, obs, limits);
@@ -614,6 +660,13 @@ export class GoalAgent {
       if (!action) {
         const intent = autopilot(obs, limits, search);
         plan = planIntent(intent, obs, limits, search);
+        if (!plan.ok && isGoalReached(obs, limits) && !sightingConfirmed(obs, search, limits)) {
+          // Within the stop distance but seen in one frame only (vision-model sightings need two):
+          // stay and look again instead of giving up (it ended a run 1.2 m from the target).
+          log(`[Decision] target within the stop distance, not confirmed yet: looking again without moving`);
+          history.push({ step, observation: summarizeObservation(obs), action: "none (look again)", outcome: "waiting for a second sighting" });
+          continue;
+        }
         action = plan.ok ? plan.action : { kind: "finish", success: false, message: "Nessuna azione sicura disponibile." };
         outcome ||= "fallback policy";
         log(`[Decision] fallback ${describeIntent(intent)} -> ${describeAction(action)}`);
@@ -622,7 +675,14 @@ export class GoalAgent {
       }
 
       if (action.kind === "finish") {
-        return action.message || (action.success ? "Obiettivo raggiunto." : "Obiettivo non raggiunto.");
+        const message = action.message || (action.success ? "Obiettivo raggiunto." : "Obiettivo non raggiunto.");
+        if (action.success && parsed.target && this.cfg.sessionPlaces && this.navigation.navigate) {
+          // Where the robot stands now, facing the target: "torna dal frigorifero" goes back here.
+          const name = parsed.target.description.toLowerCase();
+          const saved = await this.robot.savePlace(name, `${name}: raggiunto con "${goal}", il robot guardava il bersaglio`);
+          log(`[Memory] place "${name}" ${saved.ok ? "saved" : `not saved: ${saved.text.slice(0, 120)}`}`);
+        }
+        return message;
       }
       // Perception and reasoning can be slow: never act on a stale observation past the deadline.
       if ((performance.now() - startedAt) / 1000 > this.cfg.maxSeconds) {
@@ -638,14 +698,29 @@ export class GoalAgent {
       }
       if (action.kind === "frontier") {
         const startedAt = performance.now();
+        const before = await this.robot.robotPose().catch(() => null);
         const frontier = await this.robot.exploreFrontier();
-        log(`[Timing] AgenticROS explore(frontier): ${elapsed(startedAt)}s -> ${frontier.ok ? "reached" : "failed"}`);
-        frontierFailures = frontier.ok ? 0 : frontierFailures + 1;
+        const after = before ? await this.robot.robotPose().catch(() => null) : null;
+        // With a pose estimate, a trip counts when the robot moved (not by its duration).
+        const movedM = before && after ? Math.hypot(after.x - before.x, after.y - before.y) : null;
+        const ok = frontier.ok && (movedM == null || movedM >= MIN_NAV2_TRIP_M);
+        log(
+          `[Timing] AgenticROS explore(frontier): ${elapsed(startedAt)}s -> ${ok ? "reached" : "failed"}` +
+            (movedM != null ? `, moved ${round(movedM)} m` : ""),
+        );
+        frontierFailures = ok ? 0 : frontierFailures + 1;
         if (frontierFailures >= MAX_FRONTIER_FAILURES) {
           // No reachable frontier left (or Nav2 keeps failing): explore by open directions.
           log(`[Explore] frontier exploration unavailable: ${frontier.text.slice(0, 160)}`);
           limits.frontierExploration = false;
         }
+      } else if (action.kind === "advance" && plan?.ok && plan.explore?.phase === "walk" && this.cfg.nav2Walk && this.navigation.navigate) {
+        action = await this.walkWithNav2(action);
+      } else if (
+        action.kind === "advance" && plan?.ok && !plan.explore && !plan.detour && this.cfg.nav2Approach &&
+        this.navigation.navigate && sightingConfirmed(obs, search, limits)
+      ) {
+        action = await this.approachWithNav2(action, obs, limits);
       } else {
         await this.execute(action);
       }
@@ -658,6 +733,116 @@ export class GoalAgent {
       });
     }
     return `Numero massimo di passi (${this.cfg.maxSteps}) raggiunto senza completare l'obiettivo.`;
+  }
+
+  /**
+   * Exploration walk as a Nav2 goal: the robot already faces the heading chosen by the
+   * controller, so the goal is `meters` straight ahead in the map frame. Nav2 plans around
+   * obstacles (also the low ones the camera misses) and stops at the goal in closed loop. The
+   * distance actually covered, from the pose estimate, replaces the commanded one. Without a
+   * pose, or when Nav2 does not move the robot, the timed advance runs as before.
+   */
+  private async walkWithNav2(action: Extract<Action, { kind: "advance" }>): Promise<Action> {
+    const startedAt = performance.now();
+    const start = await this.robot.robotPose().catch(() => null);
+    if (!start) {
+      log("[Navigation] no pose estimate (ros2_robot_pose): timed exploration walk");
+      await this.execute(action);
+      return action;
+    }
+    const goal = {
+      x: start.x + action.meters * Math.cos(start.yaw),
+      y: start.y + action.meters * Math.sin(start.yaw),
+      yaw: start.yaw,
+      frame: start.frame,
+    };
+    log(`[Navigation] exploration walk with Nav2: ${round(action.meters)} m to (${round(goal.x)}, ${round(goal.y)}) in ${goal.frame}`);
+    const nav = await this.robot.navigateToPose(goal, (NAV2_WALK_BASE_S + NAV2_WALK_S_PER_M * action.meters) * 1000).catch(
+      (error: unknown) => ({ ok: false, status: error instanceof Error ? error.message : String(error), text: "" }),
+    );
+    const end = await this.robot.robotPose().catch(() => null);
+    const movedM = end ? round(Math.hypot(end.x - start.x, end.y - start.y), 2) : 0;
+    log(`[Timing] AgenticROS navigate_to_pose(walk): ${elapsed(startedAt)}s -> ${nav.status}, moved ${movedM} m`);
+    if (movedM < MIN_NAV2_TRIP_M && !nav.ok) {
+      log("[Navigation] Nav2 did not move the robot: timed exploration walk instead");
+      await this.execute(action);
+      return action;
+    }
+    return { kind: "advance", meters: movedM };
+  }
+
+  /**
+   * Target position in the map frame, with a pose estimate and Nav2 running. A far sighting
+   * stores it. A close sighting that falls there is the target the robot just drove to, not a
+   * first sighting at arrival distance (closeFirstSighting, kept for unrelated close objects):
+   * after a Nav2 approach the target is close and often off to a side when the robot stops, and
+   * the guard turned the robot away from it at 1.0 m. While the target is not visible, the search
+   * turns toward the stored position first.
+   */
+  private async rememberTarget(obs: Observation, search: SearchState, limits: PolicyLimits): Promise<void> {
+    if (!this.navigation.navigate) return;
+    const pose = await this.robot.robotPose().catch(() => null);
+    if (!pose) return;
+    const t = obs.target;
+    const arriveM = limits.stopDistanceM + limits.arriveToleranceM;
+    if (t?.visible) {
+      const dir = pose.yaw + ((t.bearing_deg ?? 0) * Math.PI) / 180;
+      const d = typeof t.distance_m === "number" ? t.distance_m : null;
+      if (d != null && d > arriveM && !t.occluded && (t.localization ?? "box") === "box") {
+        this.targetMap = {
+          x: pose.x + CAMERA_FORWARD_M * Math.cos(pose.yaw) + d * Math.cos(dir),
+          y: pose.y + CAMERA_FORWARD_M * Math.sin(pose.yaw) + d * Math.sin(dir),
+        };
+        return;
+      }
+      if (!this.targetMap) return;
+      // Close (or unknown distance): where the sighting is, else where the robot is.
+      const r = d ?? limits.stopDistanceM;
+      const sx = pose.x + CAMERA_FORWARD_M * Math.cos(pose.yaw) + r * Math.cos(dir);
+      const sy = pose.y + CAMERA_FORWARD_M * Math.sin(pose.yaw) + r * Math.sin(dir);
+      const offM = Math.hypot(sx - this.targetMap.x, sy - this.targetMap.y);
+      if (offM <= TARGET_MATCH_M) {
+        search.farSighting = { headingDeg: wrapDeg(search.headingDeg + (t.bearing_deg ?? 0)), age: 0 };
+        log(`[Memory] close sighting ${round(offM)} m from the remembered target position: approached, not a first sighting`);
+      }
+    } else if (this.targetMap && search.unsticks === 0) {
+      // After a blocked rotation the controller keeps the direction it switched to.
+      const rel = wrapDeg((Math.atan2(this.targetMap.y - pose.y, this.targetMap.x - pose.x) - pose.yaw) * (180 / Math.PI));
+      search.direction = rel >= 0 ? 1 : -1;
+    }
+  }
+
+  /**
+   * Approach of a confirmed, far target as one Nav2 goal (nav2ApproachGoal): Nav2 plans around
+   * what stands in between, so most of the way costs one step instead of one per meter. The
+   * covered distance, from the pose estimate, replaces the commanded advance; the next frame
+   * checks the target again and the visual approach finishes the last meter. Otherwise (no pose,
+   * target near, Nav2 not moving the robot) the timed advance runs as before.
+   */
+  private async approachWithNav2(action: Extract<Action, { kind: "advance" }>, obs: Observation, limits: PolicyLimits): Promise<Action> {
+    const start = await this.robot.robotPose().catch(() => null);
+    const goal = start ? nav2ApproachGoal(start, obs, limits) : null;
+    if (!start || !goal) {
+      await this.execute(action);
+      return action;
+    }
+    const startedAt = performance.now();
+    log(
+      `[Navigation] approach with Nav2: ${goal.meters} m toward the target (${round(obs.target?.distance_m ?? 0)} m away) ` +
+        `to (${round(goal.x)}, ${round(goal.y)}) in ${start.frame}`,
+    );
+    const nav = await this.robot
+      .navigateToPose({ ...goal, frame: start.frame }, (NAV2_WALK_BASE_S + NAV2_WALK_S_PER_M * goal.meters) * 1000)
+      .catch((error: unknown) => ({ ok: false, status: error instanceof Error ? error.message : String(error), text: "" }));
+    const end = await this.robot.robotPose().catch(() => null);
+    const movedM = end ? round(Math.hypot(end.x - start.x, end.y - start.y), 2) : 0;
+    log(`[Timing] AgenticROS navigate_to_pose(approach): ${elapsed(startedAt)}s -> ${nav.status}, moved ${movedM} m`);
+    if (movedM < MIN_NAV2_TRIP_M && !nav.ok) {
+      log("[Navigation] Nav2 did not move the robot: timed advance instead");
+      await this.execute(action);
+      return action;
+    }
+    return { kind: "advance", meters: movedM };
   }
 
   /**
@@ -780,7 +965,9 @@ export class GoalAgent {
     ]);
     this.navigation = caps;
     const mode = !caps.navigate ? "not running" : caps.explore ? "live map (SLAM), frontier exploration" : "known map";
-    const usable = caps.navigate && !caps.explore ? places : [];
+    // With a live SLAM map (sim-zed nav:=slam) the room coordinates of a prior map do not hold;
+    // places saved in this localization session (sessionPlaces) do.
+    const usable = caps.navigate && (!caps.explore || this.cfg.sessionPlaces) ? places : [];
     log(`[Navigation] Nav2 ${mode}; ${usable.length} known places`);
     return usable;
   }
@@ -809,6 +996,14 @@ export class GoalAgent {
         return this.describeScene(goal);
       case "move":
         return this.runMoves(parsed.moves);
+      case "remember": {
+        const saved = await this.robot.savePlace(parsed.place!, `${parsed.place}: posto salvato con "${goal}"`);
+        if (!saved.ok) return `Non riesco a salvare il posto "${parsed.place}": ${saved.text}`;
+        const at = (parseJsonObject(saved.text)?.["place"] ?? {}) as { x?: number; y?: number; frame?: string };
+        return Number.isFinite(at.x) && Number.isFinite(at.y)
+          ? `Posto "${parsed.place}" salvato in (${round(at.x!)}, ${round(at.y!)}) m nel frame ${at.frame ?? "map"}.`
+          : `Posto "${parsed.place}" salvato.`;
+      }
       case "goto": {
         const nav = await this.navigate(parsed.place!, places);
         if (!nav.ok) return nav.message;
