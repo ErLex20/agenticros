@@ -104,6 +104,13 @@ export interface PolicyLimits {
    * driving to the next frontier instead of walking toward the most open direction.
    */
   frontierExploration: boolean;
+  /**
+   * Explore from the current view only (branch mapless, no pose and no gyroscope): headings
+   * remembered from a search turn are not reliable once the robot turned back by timed
+   * rotations, so explore goes through a doorway the vision model sees now, or ahead when
+   * there is room, or turns one search step and looks again.
+   */
+  currentViewExplore?: boolean;
 }
 
 export const DEFAULT_LIMITS: PolicyLimits = {
@@ -548,6 +555,7 @@ export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimit
     }
     case "explore": {
       if (confirmed) return { ok: false, reason: `the target is visible at ${round(bearing, 0)} deg; use approach_target` };
+      if (limits.currentViewExplore) return planCurrentViewExplore(obs, search, limits);
       const exploring = search.exploreHeadingDeg != null;
       if (!exploring) {
         if (!fullTurnSearched(search, limits)) {
@@ -669,6 +677,65 @@ export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimit
       return { ok: true, action: intent };
     }
   }
+}
+
+/** Doorways farther off-axis than this are not taken while walking through one. */
+const CURRENT_VIEW_DOOR_DEG = 30;
+
+/**
+ * Explore from what the camera sees now (currentViewExplore). Each decision uses the current
+ * observation only: the doorway nearest to straight ahead (the vision model reports doorways in
+ * every frame), else the free space ahead, else one more search step to bring another view.
+ */
+function planCurrentViewExplore(obs: Observation, search: SearchState, limits: PolicyLimits): Plan {
+  const exploring = search.exploreHeadingDeg != null;
+  if (!exploring) {
+    if (!fullTurnSearched(search, limits)) {
+      return { ok: false, reason: `search a full turn here first (searched ${round(search.searchedDeg, 0)} of 360 deg)` };
+    }
+    if (search.explorations >= limits.maxExplorations) {
+      return { ok: false, reason: `explored ${search.explorations} places without seeing the target; finish` };
+    }
+  }
+  const doors = (obs.doorway_bearings_deg ?? []).filter((d) => !exploring || Math.abs(d) <= CURRENT_VIEW_DOOR_DEG);
+  const door = doors.length ? doors.reduce((a, b) => (Math.abs(b) < Math.abs(a) ? b : a)) : null;
+  if (door != null && Math.abs(door) > limits.alignToleranceDeg) {
+    return {
+      ok: true,
+      action: { kind: "rotate", degrees: round(door, 1) },
+      note: `turning to the doorway at ${round(door, 0)} deg`,
+      explore: { phase: "turn", headingDeg: round(wrapDeg(search.headingDeg + door), 1) },
+    };
+  }
+  const room = maxSafeAdvance(obs, limits);
+  if (door != null || exploring || (obs.front_clearance_m ?? 0) >= limits.exploreMinClearanceM) {
+    // Through a doorway in view the reactive drive handles what stands near it (it stops if the
+    // passage is really closed); elsewhere the free space measured ahead bounds the walk.
+    const meters = door != null
+      ? (exploring ? search.exploreRemainingM : limits.exploreStepM)
+      : Math.min(exploring ? search.exploreRemainingM : limits.exploreStepM, room);
+    if (meters >= 0.3) {
+      return {
+        ok: true,
+        action: { kind: "advance", meters },
+        note: door != null ? "walking through the doorway in view" : "walking ahead into the free space in view",
+        explore: { phase: "walk", headingDeg: search.headingDeg },
+      };
+    }
+    if (exploring) {
+      return {
+        ok: true,
+        action: { kind: "rotate", degrees: search.direction * limits.searchStepDeg },
+        note: "exploration blocked ahead; searching from here",
+        explore: { phase: "blocked", headingDeg: search.headingDeg },
+      };
+    }
+  }
+  if (search.searchedDeg >= 3 * 360) {
+    return { ok: false, reason: "no doorway or free space in any direction; finish" };
+  }
+  // A plain search step (not an exploration move): the next frame is another view to choose from.
+  return { ok: true, action: { kind: "rotate", degrees: search.direction * limits.searchStepDeg }, note: "no opening in view; turning to look for one" };
 }
 
 /**

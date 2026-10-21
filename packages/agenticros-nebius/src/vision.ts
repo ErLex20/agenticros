@@ -33,6 +33,15 @@ const PROFILES: Record<string, VisionProfile> = {
     structuredOutput: true,
   },
   "openbmb/MiniCPM-V-4_5": { grounding: "columns", width: 768, extraBody: {}, structuredOutput: false },
+  // NVIDIA open model. Reasons by default (~270 tokens, 2 s per frame): enable_thinking=false
+  // replies in ~1 s with the same box. Boxes come on a 0-1000 grid even when asked for
+  // fractions; normalizeBox detects the scale.
+  "nvidia/Nemotron-3.5-Super-VL": {
+    grounding: "box",
+    width: 1024,
+    extraBody: { chat_template_kwargs: { enable_thinking: false } },
+    structuredOutput: false,
+  },
 };
 
 /** Unknown models get the conservative column grounding unless overridden. */

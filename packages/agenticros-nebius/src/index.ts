@@ -91,6 +91,7 @@ async function main(): Promise<void> {
     forwardEfficiency: envPositive("NEBIUS_FORWARD_EFFICIENCY", 1.0, 2),
     imuTopic: envString("NEBIUS_IMU_TOPIC"),
     exploreAction: envString("NEBIUS_EXPLORE_ACTION"),
+    scanTopic: envString("NEBIUS_SCAN_TOPIC"),
   });
   process.stderr.write(
     robot.opts.imuTopic
@@ -140,6 +141,10 @@ async function main(): Promise<void> {
     nav2Walk: (envChoice("NEBIUS_NAV2_WALK", ["on", "off"] as const) ?? "on") === "on",
     nav2Approach: (envChoice("NEBIUS_NAV2_APPROACH", ["on", "off"] as const) ?? "on") === "on",
     sessionPlaces: (envChoice("NEBIUS_SESSION_PLACES", ["on", "off"] as const) ?? "off") === "on",
+    nav2: (envChoice("NEBIUS_NAV2", ["on", "off"] as const) ?? "on") === "on",
+    decisionTimeoutS: envPositive("NEBIUS_DECISION_TIMEOUT_S", 10),
+    // Mapless (no pose, no IMU): the lidar depth keeps 0.3 s of uncompensated points.
+    settleS: envNumber("NEBIUS_SETTLE_S", robot.opts.scanTopic && !robot.opts.imuTopic ? 0.5 : 0),
     depthCorridor,
     camera: {
       heightM: envPositive("NEBIUS_CAMERA_HEIGHT_M", 0.385, 3),

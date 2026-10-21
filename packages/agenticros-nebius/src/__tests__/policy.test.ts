@@ -714,3 +714,35 @@ test("nav2ApproachGoal: the approach stays visual near, off-axis, occluded or wi
   assert.equal(nav2ApproachGoal(pose, column, LIMITS), null);
   assert.ok(nav2ApproachGoal(pose, visibleAt(0, 2.5), LIMITS));
 });
+
+test("currentViewExplore: doorway in view -> turn to it, then walk through it", () => {
+  const limits = { ...LIMITS, currentViewExplore: true };
+  const search = newSearchState(1);
+  search.searchedDeg = 500;
+  const seen = obs({ front_clearance_m: 3, doorway_bearings_deg: [35, -60] });
+  const turn = planIntent({ kind: "explore" }, seen, limits, search);
+  assert.ok(turn.ok && turn.action.kind === "rotate" && turn.action.degrees === 35 && turn.explore?.phase === "turn");
+  recordAction(search, seen, turn.ok ? turn.action : { kind: "rotate", degrees: 0 }, turn, limits);
+  const aligned = obs({ front_clearance_m: 3, doorway_bearings_deg: [2] });
+  const walk = planIntent({ kind: "explore" }, aligned, limits, search);
+  assert.ok(walk.ok && walk.action.kind === "advance" && walk.explore?.phase === "walk");
+});
+
+test("currentViewExplore: no opening in view -> plain search step, and give up after three turns", () => {
+  const limits = { ...LIMITS, currentViewExplore: true };
+  const search = newSearchState(1);
+  search.searchedDeg = 500;
+  const closed = obs({ front_clearance_m: 0.5, doorway_bearings_deg: [] });
+  const step = planIntent({ kind: "explore" }, closed, limits, search);
+  assert.ok(step.ok && step.action.kind === "rotate" && step.explore === undefined);
+  const open = planIntent({ kind: "explore" }, obs({ front_clearance_m: 3 }), limits, search);
+  assert.ok(open.ok && open.action.kind === "advance");
+  search.searchedDeg = 3 * 360;
+  assert.equal(planIntent({ kind: "explore" }, closed, limits, search).ok, false);
+});
+
+test("currentViewExplore: a full turn comes first", () => {
+  const search = newSearchState(1);
+  const plan = planIntent({ kind: "explore" }, obs({ front_clearance_m: 3, doorway_bearings_deg: [0] }), { ...LIMITS, currentViewExplore: true }, search);
+  assert.equal(plan.ok, false);
+});

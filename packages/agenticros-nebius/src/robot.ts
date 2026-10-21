@@ -65,6 +65,23 @@ export interface RobotOptions {
   imuTopic?: string;
   /** Action of agenticros_explore (NEBIUS_EXPLORE_ACTION, default /explore). */
   exploreAction?: string;
+  /**
+   * Instantaneous obstacle LaserScan in the body frame (NEBIUS_SCAN_TOPIC). With it every forward
+   * motion is a reactive drive (ros2_drive_toward) instead of a timed advance.
+   */
+  scanTopic?: string;
+}
+
+/** Outcome of one ros2_drive_toward slice. */
+export interface DriveResult {
+  ok: boolean;
+  /** done, slice_end, blocked, aborted, no_scan or failed. */
+  status: string;
+  /** Commanded (not measured) distance and turn, times the efficiencies. */
+  advancedM: number;
+  turnedDeg: number;
+  headingDeg: number | null;
+  frontFreeM: number;
 }
 
 /** Estimated pose of the robot (ros2_robot_pose): localization, never the simulator ground truth. */
@@ -215,6 +232,39 @@ export class RobotTools {
   async advance(meters: number): Promise<void> {
     const seconds = meters / (this.opts.maxLinear * this.opts.forwardEfficiency);
     await this.moveChunks(this.opts.maxLinear, 0, seconds);
+  }
+
+  /**
+   * One reactive drive slice toward a bearing of the body frame (ros2_drive_toward): free heading
+   * closest to the bearing in the latest obstacle scan, stop before obstacles. No pose estimate.
+   */
+  async driveToward(bearingDeg: number, meters: number, durationS: number): Promise<DriveResult> {
+    if (this.aborted) throw new Error("motion aborted");
+    const { text, isError } = await this.call("ros2_drive_toward", {
+      bearing_deg: Math.round(bearingDeg * 10) / 10,
+      distance_m: Math.round(Math.max(0, meters) * 100) / 100,
+      duration_s: Math.round(Math.max(0.2, Math.min(3, durationS)) * 10) / 10,
+      ...(this.opts.scanTopic ? { scan_topic: this.opts.scanTopic } : {}),
+      max_linear: this.opts.maxLinear,
+      max_angular: this.opts.maxAngular,
+      turn_efficiency: this.opts.turnEfficiency,
+      forward_efficiency: this.opts.forwardEfficiency,
+    });
+    try {
+      const r = JSON.parse(text.slice(text.indexOf("{"))) as {
+        status?: string; advanced_m?: number; turned_deg?: number; heading_deg?: number | null; front_free_m?: number;
+      };
+      return {
+        ok: !isError,
+        status: r.status ?? (isError ? "failed" : "done"),
+        advancedM: r.advanced_m ?? 0,
+        turnedDeg: r.turned_deg ?? 0,
+        headingDeg: r.heading_deg ?? null,
+        frontFreeM: r.front_free_m ?? 0,
+      };
+    } catch {
+      return { ok: false, status: "failed", advancedM: 0, turnedDeg: 0, headingDeg: null, frontFreeM: 0 };
+    }
   }
 
   /** Walk backwards (no rear sensing: short distances only, to free the body). */

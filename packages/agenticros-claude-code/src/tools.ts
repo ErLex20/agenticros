@@ -44,6 +44,7 @@ import {
 } from "@agenticros/core";
 import { getMissionRegistry } from "./mission-registry.js";
 import { startMotionDebug } from "./motion-debug.js";
+import { chooseHeading, driveCommand, scanPoints, type ScanPoint } from "./drive.js";
 import {
   ROS_MSG_COMPRESSED_IMAGE,
   ROS_MSG_IMAGE,
@@ -629,6 +630,36 @@ export const TOOLS: McpTool[] = [
     },
   },
   {
+    name: "ros2_drive_toward",
+    description:
+      "Drive for a short time (at most 3 s) toward a direction in the body frame (bearing_deg, positive = left), " +
+      "avoiding obstacles of an instantaneous LaserScan (scan_topic, body frame) with no pose estimate: picks the free " +
+      "heading closest to the bearing, slows down and stops before obstacles. Within the call the bearing and distance " +
+      "left are the requested ones minus the motion commanded so far (times the efficiencies). Stops on ros2_estop.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bearing_deg: { type: "number", description: "Direction to reach, body frame, degrees, positive = left." },
+        distance_m: { type: "number", minimum: 0, maximum: 5, description: "Distance to cover at most (0: only turn)." },
+        duration_s: { type: "number", minimum: 0.2, maximum: 3, description: "Time slice (default 1.5 s)." },
+        scan_topic: { type: "string", description: "sensor_msgs/LaserScan in the body frame (default AGENTICROS_SCAN_TOPIC)." },
+        max_linear: { type: "number", description: "m/s, clamped to the safety limit (default 0.25)." },
+        max_angular: { type: "number", description: "rad/s, clamped to the safety limit (default 0.5)." },
+        half_width_m: { type: "number", description: "Half width of the body corridor (default 0.25)." },
+        stop_clearance_m: {
+          type: "number",
+          description:
+            "Stop advancing with less free space ahead, measured from the base centre like the scan (default 0.7: " +
+            "the Go2 nose is ~0.35 m ahead, and the scan drops points within 0.45 m as the robot's own body).",
+        },
+        turn_efficiency: { type: "number", description: "Fraction of the commanded yaw the base achieves (default 1)." },
+        forward_efficiency: { type: "number", description: "Fraction of the commanded distance the base achieves (default 1)." },
+        robot_id: { type: "string", description: "Optional robot id (from ros2_list_robots) to scope this call. When omitted, the active robot is used." },
+      },
+      required: ["bearing_deg", "distance_m"],
+    },
+  },
+  {
     name: "ros2_robot_pose",
     description:
       "Estimated pose of the robot in the map frame (x, y in m, yaw in rad counter-clockwise) from the " +
@@ -743,6 +774,12 @@ export const TOOLS: McpTool[] = [
  */
 let timedMotionAborted = false;
 const activeTimedMotions = new Set<Promise<void>>();
+/**
+ * Incremented by every ros2_estop: motions in progress (ros2_move_for, ros2_drive_toward) stop at
+ * their next cycle. Before, an estop published a zero Twist while a ros2_move_for kept publishing
+ * its command until its own deadline (up to 3 s).
+ */
+let estopGeneration = 0;
 
 /** Stop every in-flight ros2_move_for and wait (bounded) for its stop publishes. */
 export async function abortTimedMotion(timeoutMs = 1500): Promise<void> {
@@ -1406,6 +1443,7 @@ export async function handleToolCall(
       let finishTracking!: () => void;
       const tracked = new Promise<void>((resolve) => { finishTracking = resolve; });
       activeTimedMotions.add(tracked);
+      const generation = estopGeneration;
       const debug = startMotionDebug(transport, topic);
       let publishCount = 0;
       try {
@@ -1413,7 +1451,7 @@ export async function handleToolCall(
         debug.phase("command");
         process.stderr.write(`[MotionDebug] command topic=${topic} body vx=${linearX} vy=0 wz=${angularZ} duration=${durationSeconds}s\n`);
         const deadline = Date.now() + durationSeconds * 1000;
-        while (Date.now() < deadline && !timedMotionAborted) {
+        while (Date.now() < deadline && !timedMotionAborted && estopGeneration === generation) {
           await transport.publish({ topic, type, msg: message });
           publishCount++;
           const remaining = deadline - Date.now();
@@ -1749,6 +1787,7 @@ export async function handleToolCall(
     }
 
     case "ros2_estop": {
+      estopGeneration++;
       await stopFollowMeLocalIfPresent(robot.id);
       await stopFollowMeDepthIfPresent(robot.id);
       let result = emergencyStopRobot(transport, robot, config);
@@ -1911,6 +1950,107 @@ export async function handleToolCall(
           isError: true,
         };
       }
+    }
+
+    case "ros2_drive_toward": {
+      const bearingDeg = Number(args["bearing_deg"]);
+      const distanceM = Number(args["distance_m"]);
+      const durationS = args["duration_s"] != null ? Number(args["duration_s"]) : 1.5;
+      if (![bearingDeg, distanceM, durationS].every(Number.isFinite) || distanceM < 0 || distanceM > 5 || durationS < 0.2 || durationS > 3) {
+        return { content: [{ type: "text", text: "bearing_deg, distance_m (0-5) and duration_s (0.2-3) must be finite." }], isError: true };
+      }
+      const scanTopic = typeof args["scan_topic"] === "string" && args["scan_topic"] ? args["scan_topic"] : process.env.AGENTICROS_SCAN_TOPIC;
+      if (!scanTopic) {
+        return { content: [{ type: "text", text: "ros2_drive_toward needs scan_topic (or AGENTICROS_SCAN_TOPIC)." }], isError: true };
+      }
+      const limits = resolveSafetyForRobot(config, robot);
+      const num = (key: string, fallback: number) => (Number.isFinite(Number(args[key])) && args[key] != null ? Number(args[key]) : fallback);
+      const maxLinear = Math.min(num("max_linear", 0.25), limits.maxLinearVelocity ?? 0.25);
+      const maxAngular = Math.min(num("max_angular", 0.5), limits.maxAngularVelocity ?? 0.5);
+      const turnEff = num("turn_efficiency", 1);
+      const fwdEff = num("forward_efficiency", 1);
+      const stopClearanceM = num("stop_clearance_m", 0.7);
+      const heading = {
+        halfWidthM: num("half_width_m", 0.25),
+        maxHeadingDeg: 60,
+        stepDeg: 5,
+        lookaheadM: 3,
+        minFreeM: stopClearanceM + 0.1,
+        wantedFreeM: 0,
+      };
+      const command = { maxLinear, maxAngular, turnGain: 1.5, turnInPlaceDeg: 35, stopClearanceM, slowDownM: 0.6 };
+      const topic = resolveBinding(robot, "cmd_vel", { cmdVelTopic: config.teleop?.cmdVelTopic }) ?? "/cmd_vel";
+      const type = "geometry_msgs/msg/Twist";
+      if (timedMotionAborted) {
+        return { content: [{ type: "text", text: "Motion refused: the AgenticROS server is shutting down." }], isError: true };
+      }
+      let latest: { points: ScanPoint[]; at: number } | null = null;
+      const sub = transport.subscribe({ topic: scanTopic, type: "sensor_msgs/msg/LaserScan" }, (msg) => {
+        const m = msg as { ranges?: ArrayLike<number>; angle_min?: number; angle_increment?: number; range_max?: number };
+        if (!m.ranges || !Number.isFinite(m.angle_min) || !Number.isFinite(m.angle_increment)) return;
+        latest = { points: scanPoints({ ranges: Array.from(m.ranges), angle_min: m.angle_min!, angle_increment: m.angle_increment!, range_max: m.range_max }), at: Date.now() };
+      });
+      let finishTracking!: () => void;
+      const tracked = new Promise<void>((resolve) => { finishTracking = resolve; });
+      activeTimedMotions.add(tracked);
+      const generation = estopGeneration;
+      const startedAt = Date.now();
+      let status = "slice_end";
+      let turnedDeg = 0;
+      let advancedM = 0;
+      let last = { headingDeg: null as number | null, frontFreeM: 0 };
+      try {
+        while (!latest && Date.now() - startedAt < 1000) await new Promise((r) => setTimeout(r, 20));
+        const deadline = startedAt + durationS * 1000;
+        let tick = Date.now();
+        while (Date.now() < deadline) {
+          if (timedMotionAborted || estopGeneration !== generation) { status = "aborted"; break; }
+          const scan = latest as { points: ScanPoint[]; at: number } | null;
+          if (!scan || Date.now() - scan.at > 500) { status = "no_scan"; break; }
+          const remainingDeg = bearingDeg - turnedDeg;
+          const remainingM = distanceM - advancedM;
+          if (remainingM <= 0.02 && Math.abs(remainingDeg) < 3) { status = "done"; break; }
+          const choice = chooseHeading(scan.points, remainingDeg, { ...heading, wantedFreeM: Math.min(Math.max(remainingM, 0), 1.5) + 0.3 });
+          last = { headingDeg: choice.headingDeg, frontFreeM: choice.frontFreeM };
+          if (choice.headingDeg == null) { status = "blocked"; break; }
+          const cmd = driveCommand(choice.headingDeg, choice.frontFreeM, remainingM, command);
+          if (remainingM > 0.02 && cmd.linear === 0 && choice.frontFreeM <= stopClearanceM && Math.abs(choice.headingDeg) < 5) {
+            status = "blocked";
+            break;
+          }
+          await transport.publish({ topic, type, msg: { linear: { x: cmd.linear, y: 0, z: 0 }, angular: { x: 0, y: 0, z: cmd.angular } } });
+          await new Promise((r) => setTimeout(r, 50));
+          const now = Date.now();
+          const dt = (now - tick) / 1000;
+          tick = now;
+          turnedDeg += ((cmd.angular * dt * turnEff) * 180) / Math.PI;
+          advancedM += cmd.linear * dt * fwdEff;
+        }
+      } finally {
+        try { sub.unsubscribe(); } catch { /* ignore */ }
+        const zero = { linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } };
+        for (let i = 0; i < 3; i++) {
+          try { await transport.publish({ topic, type, msg: zero }); } catch { /* keep trying */ }
+        }
+        activeTimedMotions.delete(tracked);
+        finishTracking();
+      }
+      const ok = status === "done" || status === "slice_end";
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            success: ok,
+            status,
+            advanced_m: Math.round(advancedM * 100) / 100,
+            turned_deg: Math.round(turnedDeg * 10) / 10,
+            heading_deg: last.headingDeg,
+            front_free_m: Math.round(last.frontFreeM * 100) / 100,
+            elapsed_s: Math.round((Date.now() - startedAt) / 100) / 10,
+          }),
+        }],
+        isError: !ok,
+      };
     }
 
     case "ros2_robot_pose": {

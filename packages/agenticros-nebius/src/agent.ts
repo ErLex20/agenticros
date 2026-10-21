@@ -73,6 +73,14 @@ const MIN_NAV2_TRIP_M = 0.3;
 const NAV2_WALK_S_PER_M = 20;
 const NAV2_WALK_BASE_S = 30;
 
+/** Reactive approach (no pose): stop this much short of the stop distance; the next frame finishes. */
+const REACTIVE_APPROACH_MARGIN_M = 0.15;
+/** Longest reactive drive between two observations of the target. */
+const REACTIVE_MAX_STEP_M = 1.5;
+const REACTIVE_MAX_SLICES = 3;
+/** A slice that turned more than this went around something: look again before driving on. */
+const REACTIVE_DEVIATION_DEG = 10;
+
 /** Camera ahead of the base (Go2 head, ~0.33 m), for placing a sighting in the map frame. */
 const CAMERA_FORWARD_M = 0.3;
 /** A close sighting within this distance of the remembered target position is the same target. */
@@ -132,6 +140,12 @@ export interface AgentConfig {
    * map too, since the map frame of EKF + LIO-SAM holds for the whole session.
    */
   sessionPlaces: boolean;
+  /** Time budget of one step decision of the reasoning model (s); beyond it the fallback policy decides. */
+  decisionTimeoutS: number;
+  /** Wait after every motion before observing (s): the window of the uncompensated lidar depth. */
+  settleS: number;
+  /** false (NEBIUS_NAV2=off, branch mapless): do not look for Nav2 at all. */
+  nav2?: boolean;
 }
 
 type GoalMode = "approach" | "describe" | "move" | "stop" | "goto" | "remember";
@@ -320,12 +334,16 @@ export class GoalAgent {
     tools?: OpenAI.Chat.Completions.ChatCompletionTool[],
   ): Promise<OpenAI.Chat.Completions.ChatCompletionMessage | undefined> {
     const startedAt = performance.now();
+    // A step decision has a short budget and no retry: when the endpoint hangs (Nemotron
+    // Lightning timed out for hours on 21 October) the deterministic policy takes over at
+    // once instead of after 2 x 60 s. Parsing the request keeps the client defaults.
+    const options = tools ? { timeout: this.cfg.decisionTimeoutS * 1000, maxRetries: 0 } : undefined;
     const response = await this.api.chat.completions.create({
       model: this.cfg.reasoningModel,
       temperature: 0,
       messages,
       ...(tools ? { tools, tool_choice: "auto" as const, parallel_tool_calls: false } : {}),
-    });
+    }, options);
     log(`[Timing] Nebius reasoning: ${elapsed(startedAt)}s`);
     return response.choices[0]?.message;
   }
@@ -595,6 +613,8 @@ export class GoalAgent {
       ...this.cfg.limits,
       ...(parsed.stopDistanceM != null ? { stopDistanceM: parsed.stopDistanceM } : {}),
       frontierExploration: this.navigation.navigate && this.navigation.explore,
+      // No pose and no gyroscope (reactive drive on the scan): explore from the current view.
+      currentViewExplore: !!this.robot.opts.scanTopic && !this.robot.opts.imuTopic,
     };
     if (limits.frontierExploration) limits.maxExplorations = Math.max(limits.maxExplorations, FRONTIER_MAX_EXPLORATIONS);
     const search: SearchState = newSearchState(parsed.searchDirection);
@@ -721,10 +741,17 @@ export class GoalAgent {
         this.navigation.navigate && sightingConfirmed(obs, search, limits)
       ) {
         action = await this.approachWithNav2(action, obs, limits);
+      } else if (action.kind === "advance" && this.robot.opts.scanTopic) {
+        action = await this.driveReactive(action, plan, obs, limits);
       } else {
         await this.execute(action);
       }
       recordAction(search, obs, action, plan, limits);
+      if (this.cfg.settleS > 0) {
+        // Without a pose the lidar depth is not motion-compensated: let its window refill with
+        // points taken standing still before the next observation (smeared walls read 0.3-0.6 m).
+        await new Promise<void>((resolve) => setTimeout(resolve, this.cfg.settleS * 1000));
+      }
       history.push({
         step,
         observation: summarizeObservation(obs),
@@ -733,6 +760,48 @@ export class GoalAgent {
       });
     }
     return `Numero massimo di passi (${this.cfg.maxSteps}) raggiunto senza completare l'obiettivo.`;
+  }
+
+  /**
+   * Forward motion as reactive drive slices (ros2_drive_toward) on the instantaneous obstacle
+   * scan, with no pose estimate (branch mapless). Toward a confirmed target the bearing is the
+   * target's and the distance is what is left to the stop distance (at most 1.5 m per step);
+   * exploration walks and detours drive straight ahead. Slices continue while the drive keeps
+   * near the requested bearing; a deviation around an obstacle, a block or an abort ends the step,
+   * and the next observation (vision model) aims again. The commanded distance, not a measured
+   * one, goes to the search state.
+   */
+  private async driveReactive(
+    action: Extract<Action, { kind: "advance" }>,
+    plan: Plan | null,
+    obs: Observation,
+    limits: PolicyLimits,
+  ): Promise<Action> {
+    const t = obs.target;
+    const toTarget = !!plan?.ok && !plan.explore && !plan.detour && !!t?.visible && (t.localization ?? "box") === "box";
+    let bearing = toTarget ? (t!.bearing_deg ?? 0) : 0;
+    let remaining = action.meters;
+    if (toTarget && typeof t!.distance_m === "number" && !t!.occluded) {
+      remaining = Math.max(0.1, Math.min(t!.distance_m - limits.stopDistanceM - REACTIVE_APPROACH_MARGIN_M, REACTIVE_MAX_STEP_M));
+    }
+    const startedAt = performance.now();
+    const speed = this.robot.opts.maxLinear * this.robot.opts.forwardEfficiency;
+    let advanced = 0;
+    let status = "";
+    for (let slice = 0; slice < REACTIVE_MAX_SLICES && remaining > 0.05; slice++) {
+      const r = await this.robot.driveToward(bearing, remaining, remaining / speed + 0.6);
+      advanced += r.advancedM;
+      remaining -= r.advancedM;
+      bearing -= r.turnedDeg;
+      status = r.status;
+      log(
+        `[Drive] ${toTarget ? "toward the target" : "ahead"}: ${r.status}, ${round(r.advancedM)} m, turned ${round(r.turnedDeg, 0)} deg, ` +
+          `heading ${r.headingDeg ?? "none"} deg, free ahead ${r.frontFreeM} m`,
+      );
+      if (!r.ok || Math.abs(r.turnedDeg) > REACTIVE_DEVIATION_DEG) break;
+    }
+    log(`[Timing] AgenticROS drive_toward(${round(action.meters)} m): ${elapsed(startedAt)}s -> ${status}, ${round(advanced)} m`);
+    return { kind: "advance", meters: round(advanced, 2) };
   }
 
   /**
@@ -959,6 +1028,10 @@ export class GoalAgent {
    * yet, so room coordinates are not used: it explores instead.
    */
   private async navigationPlaces(): Promise<Place[]> {
+    if (this.cfg.nav2 === false) {
+      log("[Navigation] Nav2 disabled (NEBIUS_NAV2=off): reactive drive on the obstacle scan, no map, no places");
+      return [];
+    }
     const [places, caps] = await Promise.all([
       this.robot.listPlaces().catch(() => []),
       this.robot.navigationCapabilities().catch(() => ({ navigate: false, explore: false })),

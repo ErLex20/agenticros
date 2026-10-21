@@ -88,6 +88,7 @@ function main(): void {
     "ros2_follow_me_start",
     "ros2_navigate_to_place",
     "ros2_navigate_to_pose",
+    "ros2_drive_toward",
     "run_mission",
   ]);
   let motionUsed = false;
