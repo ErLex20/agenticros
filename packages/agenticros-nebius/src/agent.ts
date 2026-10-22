@@ -61,6 +61,11 @@ const FRONT_ROI = { x_min: 0.4, y_min: 0.25, x_max: 0.6, y_max: 0.5 };
 /** Half width of the 3D corridor in front of the body checked for low obstacles (Go2 ~0.31 m wide, plus margin). */
 const CORRIDOR_HALF_WIDTH_M = 0.25;
 
+/** Crop checks in a row that confirm a sighting first seen already within arrival distance. */
+const CLOSE_SIGHTING_VERIFIED = 2;
+/** Steps of looking again at an unconfirmed target within the stop distance before giving up. */
+const MAX_LOOK_AGAIN = 3;
+
 /** Upper bound on explicit motions parsed from one request. */
 const MAX_EXPLICIT_MOVES = 8;
 
@@ -305,6 +310,10 @@ export class GoalAgent {
   private navigation: NavigationCapabilities = { navigate: false, explore: false };
   /** Map position of the target from its last far sighting (with a pose estimate). */
   private targetMap: { x: number; y: number } | null = null;
+  /** Consecutive frames in which the crop check really answered "match" (not a failed call). */
+  private verifyMatches = 0;
+  /** Consecutive steps spent looking again at an unconfirmed target within the stop distance. */
+  private lookAgain = 0;
 
   constructor(
     private readonly api: OpenAI,
@@ -599,6 +608,8 @@ export class GoalAgent {
     if (limits.frontierExploration) limits.maxExplorations = Math.max(limits.maxExplorations, FRONTIER_MAX_EXPLORATIONS);
     const search: SearchState = newSearchState(parsed.searchDirection);
     this.targetMap = null;
+    this.verifyMatches = 0;
+    this.lookAgain = 0;
     const history: HistoryEntry[] = [];
     let frontierFailures = 0;
     let perceptionFailures = 0;
@@ -634,6 +645,13 @@ export class GoalAgent {
       log(`[Step ${step}] ${summarizeObservation(obs)}`);
       log(`[Scene] ${obs.scene}`);
       recordObservation(search, obs, limits);
+      if (search.closeFirstSighting && this.verifyMatches >= CLOSE_SIGHTING_VERIFIED) {
+        // A target first seen already within arrival distance is not confirmed by repetition alone
+        // (a sofa 0.37 m ahead passed for a bed), but two crop checks in a row naming it are enough:
+        // on the real Go2, started 0.9 m from a chair, the guard kept it waiting for good.
+        log(`[Verify] ${this.verifyMatches} crop checks in a row confirm the close sighting`);
+        search.closeFirstSighting = false;
+      }
       await this.suggestExploration(obs, parsed.target, search, limits);
 
       let proposed: Intent | null = null;
@@ -660,14 +678,20 @@ export class GoalAgent {
       if (!action) {
         const intent = autopilot(obs, limits, search);
         plan = planIntent(intent, obs, limits, search);
-        if (!plan.ok && isGoalReached(obs, limits) && !sightingConfirmed(obs, search, limits)) {
+        if (!plan.ok && isGoalReached(obs, limits) && !sightingConfirmed(obs, search, limits) && this.lookAgain < MAX_LOOK_AGAIN) {
+          this.lookAgain += 1;
           // Within the stop distance but seen in one frame only (vision-model sightings need two):
           // stay and look again instead of giving up (it ended a run 1.2 m from the target).
           log(`[Decision] target within the stop distance, not confirmed yet: looking again without moving`);
           history.push({ step, observation: summarizeObservation(obs), action: "none (look again)", outcome: "waiting for a second sighting" });
           continue;
         }
-        action = plan.ok ? plan.action : { kind: "finish", success: false, message: "Nessuna azione sicura disponibile." };
+        if (plan.ok || !isGoalReached(obs, limits)) this.lookAgain = 0;
+        action = plan.ok
+          ? plan.action
+          : isGoalReached(obs, limits)
+            ? { kind: "finish", success: false, message: "Il bersaglio sembra davanti al robot, ma non è stato confermato." }
+            : { kind: "finish", success: false, message: "Nessuna azione sicura disponibile." };
         outcome ||= "fallback policy";
         log(`[Decision] fallback ${describeIntent(intent)} -> ${describeAction(action)}`);
       } else {
@@ -902,13 +926,17 @@ export class GoalAgent {
    */
   private async checkVisionSighting(obs: Observation, target: TargetSpec | null, search: SearchState, limits: PolicyLimits): Promise<void> {
     const t = obs.target;
+    if (!t?.visible) this.verifyMatches = 0;
     if (!t?.visible || t.source !== "vlm" || !target || !this.lastImage) return;
     const confirming = search.sightingStreak + 1 === 2;
     if (!confirming && !isGoalReached(obs, limits)) return;
+    let answered = true;
     const match = await this.perception.verifyCandidate(this.lastImage, t, target, 1, true).catch((error: unknown) => {
       log(`[Verify] failed, sighting kept: ${error instanceof Error ? error.message : String(error)}`);
+      answered = false;
       return true;
     });
+    this.verifyMatches = match && answered ? this.verifyMatches + 1 : 0;
     if (!match) obs.target = { visible: false, source: "vlm", localization: t.localization ?? "box" };
   }
 
