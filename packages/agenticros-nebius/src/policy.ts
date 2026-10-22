@@ -111,6 +111,13 @@ export interface PolicyLimits {
    * there is room, or turns one search step and looks again.
    */
   currentViewExplore?: boolean;
+  /**
+   * Forward motions are reactive drives on the obstacle scan (ros2_drive_toward), which pick a
+   * free heading and stop before obstacles on their own: the free space seen by the camera does
+   * not refuse an approach nor start a "blocked" detour (the timed 40 deg detours fought the
+   * drive in front of a glass door frame for 15 steps). "Stuck" detours stay.
+   */
+  reactiveDrive?: boolean;
 }
 
 export const DEFAULT_LIMITS: PolicyLimits = {
@@ -620,7 +627,8 @@ export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimit
         return { ok: true, action: { kind: "rotate", degrees: bearing }, note: "aligning with the target before advancing" };
       }
       if (isGoalReached(obs, limits)) return { ok: false, reason: "the target is already within the stop distance; finish" };
-      const allowed = maxSafeAdvance(obs, limits);
+      // With the reactive drive only the target-distance caps apply here; obstacles are its job.
+      const allowed = maxSafeAdvance(limits.reactiveDrive ? { ...obs, front_clearance_m: REACTIVE_CLEARANCE_M } : obs, limits);
       if (allowed < 0.1) return { ok: false, reason: `no room to advance safely (allowed ${round(allowed)} m)` };
       // The model's step is a cap, floored at 0.5 m (1 m while the target is far): copying a
       // small value from the history (approach_target(0.1 m), or a 0.5 m step clamped earlier)
@@ -674,10 +682,22 @@ export function planIntent(intent: Intent, obs: Observation, limits: PolicyLimit
       if (intent.success && !sightingConfirmed(obs, search, limits)) {
         return { ok: false, reason: "the target was seen with low confidence only once; look again before finishing" };
       }
+      if (!intent.success && limits.currentViewExplore && !obs.target?.visible) {
+        // Giving up while the target was not seen and exploring is still possible (in simulation
+        // the fallback Nemotron gave up 2.5 m into the house, with the chosen doorway in view).
+        const explore = planIntent({ kind: "explore" }, obs, limits, search);
+        const search_ = planIntent({ kind: "search" }, obs, limits, search);
+        if (explore.ok || search_.ok) {
+          return { ok: false, reason: `the target was not found yet and ${explore.ok ? "explore" : "search"} is still possible; use it` };
+        }
+      }
       return { ok: true, action: intent };
     }
   }
 }
+
+/** Clearance assumed for the target-distance caps when the reactive drive handles obstacles. */
+const REACTIVE_CLEARANCE_M = 10;
 
 /** Doorways farther off-axis than this are not taken while walking through one. */
 const CURRENT_VIEW_DOOR_DEG = 30;
@@ -954,7 +974,7 @@ export function recordObservation(search: SearchState, obs: Observation, limits:
     search.exploreRemainingM = 0;
     // If the target is lost later, look for it on the side where it was last seen.
     if (Math.abs(t.bearing_deg ?? 0) > 5) search.direction = (t.bearing_deg ?? 0) > 0 ? 1 : -1;
-    if (!search.detour && search.detours < MAX_DETOURS && blockedAhead(obs, limits) && !isGoalReached(obs, limits)) {
+    if (!limits.reactiveDrive && !search.detour && search.detours < MAX_DETOURS && blockedAhead(obs, limits) && !isGoalReached(obs, limits)) {
       // Something closer than the target is in the way (in simulation the frame of a glass
       // door 0.48 m ahead, the bed 3.2 m beyond it, the free passage 60 deg to the left).
       // Go around it on the target's side first, then on the other side.

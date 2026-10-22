@@ -78,8 +78,34 @@ const REACTIVE_APPROACH_MARGIN_M = 0.15;
 /** Longest reactive drive between two observations of the target. */
 const REACTIVE_MAX_STEP_M = 1.5;
 const REACTIVE_MAX_SLICES = 3;
+/** A slice that commanded this much but shortened the ranges ahead by less than the next is stuck. */
+const STUCK_MIN_COMMANDED_M = 0.4;
+const STUCK_MAX_PROGRESS_M = 0.1;
+/** Consecutive slices without progress before the drive counts as stuck (one can be a misreading). */
+const STUCK_SLICES = 2;
+/** Stop clearance of the reactive drive from the base centre (m): default, and floor for close targets. */
+const DRIVE_CLEARANCE_M = 0.7;
+const DRIVE_MIN_CLEARANCE_M = 0.5;
+/** Wait before retrying a blocked drive once (a person crossing usually clears in that time). */
+const BLOCKED_WAIT_S = 2;
 /** A slice that turned more than this went around something: look again before driving on. */
 const REACTIVE_DEVIATION_DEG = 10;
+
+/** Budget of the request parsing call (s): longer than a step decision, without retries. */
+const GOAL_TIMEOUT_S = 30;
+/** Calls served by the fallback reasoning model after a failure of the primary. */
+const FALLBACK_CALLS = 5;
+
+/** Semantic waypoint: walk this far beyond the opening to be through it. */
+const WAYPOINT_PASS_M = 1.0;
+const WAYPOINT_MAX_WALK_M = 5;
+/** Frames in a row without the waypoint (outside a walk) before falling back to current doorways. */
+const WAYPOINT_MAX_MISSED = 3;
+/** Route waypoints per task, and blocked drives toward a visible target before asking for one. */
+const MAX_ROUTE_ATTEMPTS = 2;
+const ROUTE_AFTER_BLOCKED = 2;
+/** Places kept in the text memory given to the vision model. */
+const MAX_PLACE_LOG = 4;
 
 /** Camera ahead of the base (Go2 head, ~0.33 m), for placing a sighting in the map frame. */
 const CAMERA_FORWARD_M = 0.3;
@@ -142,6 +168,11 @@ export interface AgentConfig {
   sessionPlaces: boolean;
   /** Time budget of one step decision of the reasoning model (s); beyond it the fallback policy decides. */
   decisionTimeoutS: number;
+  /**
+   * Reasoning model used when the primary one fails or times out (NEBIUS_FALLBACK_REASONING_MODEL,
+   * default nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B; empty: none, the deterministic policy decides).
+   */
+  fallbackReasoningModel?: string;
   /** Wait after every motion before observing (s): the window of the uncompensated lidar depth. */
   settleS: number;
   /** false (NEBIUS_NAV2=off, branch mapless): do not look for Nav2 at all. */
@@ -203,6 +234,12 @@ function describeIntent(intent: Intent): string {
     default:
       return describeAction(intent);
   }
+}
+
+/** One line for the place memory: the first sentence of a few scene summaries of the turn. */
+function summarizeScenes(scenes: string[]): string {
+  const firsts = scenes.map((s) => s.split(/(?<=\.)\s/)[0]!.trim()).filter((s) => s.length > 0);
+  return firsts.slice(0, 3).join(" ").slice(0, 300) || "no description";
 }
 
 function summarizeObservation(obs: Observation): string {
@@ -315,8 +352,25 @@ export class GoalAgent {
   private turnViews: { turnId: number; views: { headingDeg: number; image: Buffer }[] } = { turnId: -1, views: [] };
   /** Turn for which the vision model was already asked where to explore. */
   private askedTurnId = -1;
+  /**
+   * Semantic waypoint (no pose): the opening the vision model chose after a search turn, found
+   * again in every frame by its description. pendingTurnDeg is the one timed turn toward the
+   * chosen view; afterwards only what the camera sees steers the robot.
+   */
+  private waypoint: { description: string; pendingTurnDeg: number | null; missed: number; explorations: number; route?: boolean } | null = null;
+  /** Route waypoints tried this task (the target was in view but not reachable straight). */
+  private routeAttempts = 0;
+  /** Consecutive reactive drives toward the target that ended blocked or stuck without moving. */
+  private blockedTowardTarget = 0;
+  /** The waypoint as seen in the latest frame (box, bearing, lidar distance). */
+  private lastWaypoint: TargetObservation | null = null;
+  /** What the robot saw at each place and which opening it took: text memory for the next choices. */
+  private placeLog: string[] = [];
+  private turnScenes: { turnId: number; scenes: string[] } = { turnId: -1, scenes: [] };
   /** Navigation stack detected at the start of the run. */
   private navigation: NavigationCapabilities = { navigate: false, explore: false };
+  /** Calls left on the fallback reasoning model after a failure of the primary one. */
+  private fallbackCalls = 0;
   /** Map position of the target from its last far sighting (with a pose estimate). */
   private targetMap: { x: number; y: number } | null = null;
 
@@ -337,14 +391,34 @@ export class GoalAgent {
     // A step decision has a short budget and no retry: when the endpoint hangs (Nemotron
     // Lightning timed out for hours on 21 October) the deterministic policy takes over at
     // once instead of after 2 x 60 s. Parsing the request keeps the client defaults.
-    const options = tools ? { timeout: this.cfg.decisionTimeoutS * 1000, maxRetries: 0 } : undefined;
-    const response = await this.api.chat.completions.create({
-      model: this.cfg.reasoningModel,
-      temperature: 0,
-      messages,
-      ...(tools ? { tools, tool_choice: "auto" as const, parallel_tool_calls: false } : {}),
-    }, options);
-    log(`[Timing] Nebius reasoning: ${elapsed(startedAt)}s`);
+    const options = tools
+      ? { timeout: this.cfg.decisionTimeoutS * 1000, maxRetries: 0 }
+      : { timeout: GOAL_TIMEOUT_S * 1000, maxRetries: 0 };
+    const request = (model: string) =>
+      this.api.chat.completions.create({
+        model,
+        temperature: 0,
+        messages,
+        ...(tools ? { tools, tool_choice: "auto" as const, parallel_tool_calls: false } : {}),
+        // The fallback Nemotron (Nano) reasons by default: 33 s to parse a request, with thinking
+        // off 0.75 s and the same JSON.
+        ...(model === this.cfg.fallbackReasoningModel ? { chat_template_kwargs: { enable_thinking: false } } : {}),
+      } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming, options);
+    // After a failure of the primary model the fallback (another NVIDIA Nemotron) serves the next
+    // few calls, then the primary is tried again.
+    const fallback = this.cfg.fallbackReasoningModel;
+    const primary = this.fallbackCalls > 0 && fallback ? fallback : this.cfg.reasoningModel;
+    if (this.fallbackCalls > 0) this.fallbackCalls -= 1;
+    let response;
+    try {
+      response = await request(primary);
+    } catch (error) {
+      if (!fallback || primary === fallback) throw error;
+      log(`[Decision] ${primary} failed (${error instanceof Error ? error.message : String(error)}): retrying with ${fallback}`);
+      this.fallbackCalls = FALLBACK_CALLS;
+      response = await request(fallback);
+    }
+    log(`[Timing] Nebius reasoning: ${elapsed(startedAt)}s (${response.model ?? primary})`);
     return response.choices[0]?.message;
   }
 
@@ -467,7 +541,7 @@ export class GoalAgent {
     // not abort the run. In vlm mode the vision model is the only localizer.
     const useYolo = this.cfg.perception === "yolo" && target?.cocoClass != null;
     const [scene, candidates] = await Promise.all([
-      this.perception.describe(snapshot.image, goal, target).catch((error: unknown) => {
+      this.perception.describe(snapshot.image, goal, target, this.waypoint?.description).catch((error: unknown) => {
         log(`[Perception] vision model failed: ${error instanceof Error ? error.message : String(error)}`);
         return null;
       }),
@@ -508,6 +582,11 @@ export class GoalAgent {
         observed.occluded = true;
         observed.distance_m = null;
       }
+    }
+    this.lastWaypoint = scene?.waypoint ?? null;
+    if (this.lastWaypoint?.visible && this.lastWaypoint.bbox) {
+      const d = await this.robot.depth(innerBox(this.lastWaypoint.bbox)).catch(() => null);
+      this.lastWaypoint.distance_m = d != null ? round(d) : null;
     }
     const clearance = await clearanceP;
     const imu = await imuP;
@@ -615,10 +694,16 @@ export class GoalAgent {
       frontierExploration: this.navigation.navigate && this.navigation.explore,
       // No pose and no gyroscope (reactive drive on the scan): explore from the current view.
       currentViewExplore: !!this.robot.opts.scanTopic && !this.robot.opts.imuTopic,
+      reactiveDrive: !!this.robot.opts.scanTopic,
     };
     if (limits.frontierExploration) limits.maxExplorations = Math.max(limits.maxExplorations, FRONTIER_MAX_EXPLORATIONS);
     const search: SearchState = newSearchState(parsed.searchDirection);
     this.targetMap = null;
+    this.waypoint = null;
+    this.lastWaypoint = null;
+    this.placeLog = [];
+    this.routeAttempts = 0;
+    this.blockedTowardTarget = 0;
     const history: HistoryEntry[] = [];
     let frontierFailures = 0;
     let perceptionFailures = 0;
@@ -653,8 +738,15 @@ export class GoalAgent {
       await this.rememberTarget(obs, search, limits);
       log(`[Step ${step}] ${summarizeObservation(obs)}`);
       log(`[Scene] ${obs.scene}`);
+      if (this.activeWaypoint()?.route && obs.target?.visible && !isGoalReached(obs, limits)) {
+        // Going around: the target seen through the glass would pull the robot back to it.
+        log("[Waypoint] target in view, but going through the route opening first");
+        obs.target = { visible: false, source: obs.target.source, localization: obs.target.localization ?? "box" };
+        if (!fullTurnSearched(search, limits)) search.searchedDeg = 360 + limits.searchStepDeg;
+      }
       recordObservation(search, obs, limits);
       await this.suggestExploration(obs, parsed.target, search, limits);
+      if (limits.currentViewExplore) this.applyWaypoint(obs, search, limits);
 
       let proposed: Intent | null = null;
       if (this.cfg.policy === "llm") {
@@ -694,6 +786,27 @@ export class GoalAgent {
         log(`[Decision] Nemotron ${proposed ? describeIntent(proposed) : ""} -> ${describeAction(action)}${outcome !== "executed" ? ` (${outcome})` : ""}`);
       }
 
+      if (
+        limits.currentViewExplore && obs.target?.visible && !isGoalReached(obs, limits) && !this.activeWaypoint() &&
+        this.routeAttempts < MAX_ROUTE_ATTEMPTS && parsed.target &&
+        ((action.kind === "finish" && !action.success) || this.blockedTowardTarget >= ROUTE_AFTER_BLOCKED)
+      ) {
+        if (await this.chooseRoute(obs, parsed.target, search)) {
+          history.push({ step, observation: summarizeObservation(obs), action: "route around the obstacle", outcome: "route waypoint set" });
+          continue;
+        }
+      }
+      const wp = this.activeWaypoint();
+      if (wp?.pendingTurnDeg != null && !obs.target?.visible && action.kind !== "finish") {
+        // The one timed turn toward the opening the vision model chose; the next frames find it.
+        const degrees = round(wp.pendingTurnDeg, 1);
+        wp.pendingTurnDeg = null;
+        if (Math.abs(degrees) >= 5) {
+          action = { kind: "rotate", degrees };
+          plan = { ok: true, action, note: `turning to "${wp.description}"` };
+          log(`[Waypoint] turning ${round(degrees, 0)} deg toward "${wp.description}"`);
+        }
+      }
       if (action.kind === "finish") {
         const message = action.message || (action.success ? "Obiettivo raggiunto." : "Obiettivo non raggiunto.");
         if (action.success && parsed.target && this.cfg.sessionPlaces && this.navigation.navigate) {
@@ -786,21 +899,55 @@ export class GoalAgent {
     }
     const startedAt = performance.now();
     const speed = this.robot.opts.maxLinear * this.robot.opts.forwardEfficiency;
+    // The drive stops 0.7 m from the base centre; a shorter requested distance to the target
+    // (camera ~0.33 m ahead of the base) lowers it, never below 0.5 m: closer, the scan drops
+    // points as the robot's own body.
+    const clearance = toTarget
+      ? Math.max(DRIVE_MIN_CLEARANCE_M, Math.min(DRIVE_CLEARANCE_M, limits.stopDistanceM + CAMERA_FORWARD_M - 0.1))
+      : DRIVE_CLEARANCE_M;
     let advanced = 0;
     let status = "";
+    let waited = false;
+    let stalled = 0;
     for (let slice = 0; slice < REACTIVE_MAX_SLICES && remaining > 0.05; slice++) {
-      const r = await this.robot.driveToward(bearing, remaining, remaining / speed + 0.6);
+      let r = await this.robot.driveToward(bearing, remaining, remaining / speed + 0.6, clearance);
+      if (r.status === "blocked" && !waited) {
+        // Often a person or a pet crossing: wait once, then try the same slice again.
+        waited = true;
+        log(`[Drive] blocked (free ahead ${r.frontFreeM} m): waiting ${BLOCKED_WAIT_S} s before trying again`);
+        await new Promise<void>((resolve) => setTimeout(resolve, BLOCKED_WAIT_S * 1000));
+        advanced += r.advancedM;
+        remaining -= r.advancedM;
+        bearing -= r.turnedDeg;
+        r = await this.robot.driveToward(bearing, remaining, remaining / speed + 0.6, clearance);
+      }
+      status = r.status;
+      log(
+        `[Drive] ${toTarget ? "toward the target" : "ahead"}: ${r.status}, ${round(r.advancedM)} m commanded` +
+          `${r.progressM != null ? ` (${round(r.progressM)} m from the scan)` : ""}, turned ${round(r.turnedDeg, 0)} deg, ` +
+          `heading ${r.headingDeg ?? "none"} deg, free ahead ${r.frontFreeM} m`,
+      );
+      // A large negative "progress" is the scene ahead changing (something left the view), not a
+      // measurement: it neither proves nor rules out motion.
+      const noProgress =
+        r.advancedM >= STUCK_MIN_COMMANDED_M && r.progressM != null && r.progressM < STUCK_MAX_PROGRESS_M && r.progressM > -0.2;
+      stalled = noProgress ? stalled + 1 : 0;
+      if (stalled >= STUCK_SLICES) {
+        // Commanded forward twice, but the surfaces ahead did not get closer: the body is stuck.
+        log(`[Drive] no progress measured on the scan in ${stalled} slices: the robot is stuck, the step ends here`);
+        advanced += Math.max(0, r.progressM ?? 0);
+        status = "stuck";
+        break;
+      }
       advanced += r.advancedM;
       remaining -= r.advancedM;
       bearing -= r.turnedDeg;
-      status = r.status;
-      log(
-        `[Drive] ${toTarget ? "toward the target" : "ahead"}: ${r.status}, ${round(r.advancedM)} m, turned ${round(r.turnedDeg, 0)} deg, ` +
-          `heading ${r.headingDeg ?? "none"} deg, free ahead ${r.frontFreeM} m`,
-      );
       if (!r.ok || Math.abs(r.turnedDeg) > REACTIVE_DEVIATION_DEG) break;
     }
     log(`[Timing] AgenticROS drive_toward(${round(action.meters)} m): ${elapsed(startedAt)}s -> ${status}, ${round(advanced)} m`);
+    if (toTarget) {
+      this.blockedTowardTarget = (status === "blocked" || status === "stuck") && advanced < 0.3 ? this.blockedTowardTarget + 1 : 0;
+    }
     return { kind: "advance", meters: round(advanced, 2) };
   }
 
@@ -921,13 +1068,18 @@ export class GoalAgent {
    * picks the way to go; the controller then turns and walks that way as for any exploration.
    */
   private async suggestExploration(obs: Observation, target: TargetSpec | null, search: SearchState, limits: PolicyLimits): Promise<void> {
-    if (this.cfg.exploreChoice !== "vision" || !target || limits.frontierExploration || !this.lastImage) return;
+    const mapless = !!limits.currentViewExplore;
+    if ((this.cfg.exploreChoice !== "vision" && !mapless) || !target || limits.frontierExploration || !this.lastImage) return;
     if (search.exploreHeadingDeg != null) return; // walking: not a view of the turn
     if (this.turnViews.turnId !== search.turnId) this.turnViews = { turnId: search.turnId, views: [] };
     this.turnViews.views.push({ headingDeg: search.headingDeg, image: this.lastImage });
+    if (this.turnScenes.turnId !== search.turnId) this.turnScenes = { turnId: search.turnId, scenes: [] };
+    if (obs.scene) this.turnScenes.scenes.push(obs.scene);
     if (obs.target?.visible || !fullTurnSearched(search, limits) || this.askedTurnId === search.turnId) return;
     if (search.explorations >= limits.maxExplorations) return;
+    if (mapless && this.waypoint) return;
     this.askedTurnId = search.turnId;
+    if (mapless) return this.chooseWaypoint(target, search);
 
     const place = enterPlace(search);
     const views: { headingDeg: number; image: Buffer }[] = [];
@@ -961,6 +1113,105 @@ export class GoalAgent {
       `[Explore] vision model: view ${choice.view} (${round(tiles[choice.view]!.relativeDeg, 0)} deg${tiles[choice.view]!.explored ? ", explored" : ""}), ` +
         `x ${round(choice.x)} -> heading ${round(heading, 0)} deg (robot ${round(search.headingDeg, 0)} deg): ${choice.reason}`,
     );
+  }
+
+  /**
+   * Route waypoint: the target is in view but the straight way is closed (in simulation the bed
+   * seen through a glass partition, the passage 2 m to the side). The vision model names the
+   * opening that leads to it; the robot goes through it like an exploration waypoint, with the
+   * target hidden from the policy until then. Returns false when the model sees no opening.
+   */
+  private async chooseRoute(obs: Observation, target: TargetSpec, search: SearchState): Promise<boolean> {
+    if (!this.lastImage) return false;
+    this.routeAttempts += 1;
+    const startedAt = performance.now();
+    const route = await this.perception.chooseRouteOpening(this.lastImage, target).catch((error: unknown) => {
+      log(`[Waypoint] route choice failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    });
+    log(`[Timing] Route choice: ${elapsed(startedAt)}s`);
+    if (!route) {
+      log("[Waypoint] no opening toward the target in view: the path is blocked");
+      return false;
+    }
+    const bearing = round(bearingFromImageX((route.bbox.x_min + route.bbox.x_max) / 2, this.cfg.camera.hfovDeg), 1);
+    this.waypoint = { description: route.opening, pendingTurnDeg: bearing, missed: 0, explorations: search.explorations, route: true };
+    this.blockedTowardTarget = 0;
+    log(`[Waypoint] route to the target through "${route.opening}" at ${bearing} deg: ${route.reason}`);
+    void obs;
+    return true;
+  }
+
+  /** The waypoint set by chooseWaypoint (read through a call: other methods change it). */
+  private activeWaypoint() {
+    return this.waypoint;
+  }
+
+  /**
+   * Mapless exploration choice: the views of the turn in one mosaic, with the text memory of the
+   * places seen so far; the vision model picks the opening to go through and describes it. The
+   * view headings come from timed turns within this one turn only (bounded error); the robot
+   * turns once toward the chosen view and then follows the description, not the angle.
+   */
+  private async chooseWaypoint(target: TargetSpec, search: SearchState): Promise<void> {
+    const views: { headingDeg: number; image: Buffer }[] = [];
+    for (const v of [...this.turnViews.views].reverse()) {
+      if (!views.some((u) => Math.abs(wrapDeg(u.headingDeg - v.headingDeg)) < SAME_VIEW_DEG)) views.push(v);
+    }
+    views.sort((a, b) => wrapDeg(b.headingDeg - search.headingDeg) - wrapDeg(a.headingDeg - search.headingDeg));
+    const tiles: TurnView[] = views.map((v) => ({ image: v.image, relativeDeg: wrapDeg(v.headingDeg - search.headingDeg), explored: false }));
+    const here = summarizeScenes(this.turnScenes.scenes);
+    const memory = [...this.placeLog.slice(-MAX_PLACE_LOG), `now: ${here}`].join(" | ");
+    const startedAt = performance.now();
+    const choice = await this.perception.chooseExploreView(tiles, target, memory).catch((error: unknown) => {
+      log(`[Explore] vision model failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    });
+    log(`[Timing] Explore choice: ${elapsed(startedAt)}s`);
+    if (!choice) {
+      log("[Explore] no usable choice from the vision model: doorways of the current view");
+      this.placeLog.push(here);
+      return;
+    }
+    const turnDeg = round(wrapDeg(tiles[choice.view]!.relativeDeg + bearingFromImageX(choice.x, this.cfg.camera.hfovDeg)), 1);
+    const description = choice.opening || `the passage the robot chose in view ${choice.view}`;
+    this.waypoint = { description, pendingTurnDeg: turnDeg, missed: 0, explorations: search.explorations };
+    this.placeLog.push(`${here}; left through: ${description}`);
+    log(`[Waypoint] "${description}" in view ${choice.view} (${round(turnDeg, 0)} deg from here): ${choice.reason}`);
+  }
+
+  /**
+   * While a waypoint is active the policy sees one doorway: the waypoint, when the vision model
+   * finds it in this frame. Its lidar distance stretches the walk so that it goes through the
+   * opening. The waypoint ends when the exploration walk ends (a new search turn follows), when
+   * the target shows up, or after a few frames without it.
+   */
+  private applyWaypoint(obs: Observation, search: SearchState, limits: PolicyLimits): void {
+    const wp = this.waypoint;
+    if (!wp) return;
+    if (search.explorations > wp.explorations) {
+      log(`[Waypoint] went through "${wp.description}"`);
+      this.waypoint = null;
+      return;
+    }
+    if (obs.target?.visible) return; // the target leads; the waypoint stays for a false sighting
+    const seen = this.lastWaypoint;
+    if (seen?.visible) {
+      wp.missed = 0;
+      obs.doorway_bearings_deg = [seen.bearing_deg ?? 0];
+      if (search.exploreHeadingDeg != null && typeof seen.distance_m === "number") {
+        search.exploreRemainingM = Math.max(1, Math.min(WAYPOINT_MAX_WALK_M, seen.distance_m + WAYPOINT_PASS_M));
+      }
+      log(`[Waypoint] in view at ${seen.bearing_deg} deg, ${seen.distance_m ?? "unknown"} m`);
+      return;
+    }
+    obs.doorway_bearings_deg = [];
+    if (wp.pendingTurnDeg != null) return;
+    wp.missed += 1;
+    if (wp.missed >= WAYPOINT_MAX_MISSED && search.exploreHeadingDeg == null) {
+      log(`[Waypoint] "${wp.description}" not found in ${wp.missed} frames: doorways of the current view`);
+      this.waypoint = null;
+    }
   }
 
   /**
@@ -1058,7 +1309,26 @@ export class GoalAgent {
       : { ok: false, message: `Navigazione con Nav2 verso ${label} non riuscita (${nav.status}).` };
   }
 
+  /**
+   * Sensors the mapless drive cannot do without, checked before anything moves: with the obstacle
+   * scan missing every forward step would end at once (no_scan), and without depth the target
+   * distance is unknown. On the robot the usual cause is go2_real.launch.py not running.
+   */
+  private async preflight(): Promise<string | null> {
+    const scan = this.robot.opts.scanTopic;
+    if (!scan) return null;
+    const missing: string[] = [];
+    if (!(await this.robot.topicAlive(scan, "sensor_msgs/msg/LaserScan"))) missing.push(scan);
+    const depth = this.robot.opts.depthTopic;
+    if (depth && !(await this.robot.topicAlive(depth, "sensor_msgs/msg/Image"))) missing.push(depth);
+    if (!missing.length) return null;
+    log(`[Preflight] no messages on ${missing.join(", ")}`);
+    return `Sensori non disponibili (${missing.join(", ")}): avvia go2_real.launch.py sul robot (o la simulazione) prima dell'agente. Il robot non si è mosso.`;
+  }
+
   async run(goal: string): Promise<string> {
+    const notReady = await this.preflight();
+    if (notReady) return notReady;
     const places = await this.navigationPlaces();
     const parsed = await this.parseGoal(goal, places);
     switch (parsed.mode) {

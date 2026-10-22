@@ -143,6 +143,10 @@ async function main(): Promise<void> {
     sessionPlaces: (envChoice("NEBIUS_SESSION_PLACES", ["on", "off"] as const) ?? "off") === "on",
     nav2: (envChoice("NEBIUS_NAV2", ["on", "off"] as const) ?? "on") === "on",
     decisionTimeoutS: envPositive("NEBIUS_DECISION_TIMEOUT_S", 10),
+    fallbackReasoningModel:
+      process.env.NEBIUS_FALLBACK_REASONING_MODEL !== undefined
+        ? envString("NEBIUS_FALLBACK_REASONING_MODEL")
+        : "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
     // Mapless (no pose, no IMU): the lidar depth keeps 0.3 s of uncompensated points.
     settleS: envNumber("NEBIUS_SETTLE_S", robot.opts.scanTopic && !robot.opts.imuTopic ? 0.5 : 0),
     depthCorridor,

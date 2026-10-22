@@ -67,6 +67,11 @@ export interface ExploreChoice {
   /** Horizontal position in the chosen view to walk toward (fraction of its width, 0 = left). */
   x: number;
   reason: string;
+  /**
+   * The doorway or passage to walk toward, described so that it can be found again in later
+   * frames (a semantic waypoint: no heading or position is remembered). Empty when not given.
+   */
+  opening: string;
 }
 
 /**
@@ -86,8 +91,8 @@ const EXPLORE_TILE_W = 768;
 const EXPLORE_TILE_H = 432;
 const EXPLORE_SCHEMA = {
   type: "object",
-  properties: { reason: { type: "string" }, view: { type: "integer" }, x: { type: "number" } },
-  required: ["reason", "view", "x"],
+  properties: { reason: { type: "string" }, view: { type: "integer" }, x: { type: "number" }, opening: { type: "string" } },
+  required: ["reason", "view", "x", "opening"],
   additionalProperties: false,
 };
 
@@ -124,6 +129,8 @@ async function turnMosaic(views: TurnView[]): Promise<string> {
 export interface SceneResult {
   summary: string;
   target: TargetObservation | null;
+  /** The semantic waypoint (an opening described earlier), when one was given. */
+  waypoint?: TargetObservation | null;
   /** Bearings (deg, positive = left) of doorways or passages to other rooms; reported only when a target is given. */
   doorwayBearingsDeg: number[];
 }
@@ -261,18 +268,26 @@ export class Perception {
   }
 
   /** Scene summary plus target localization from the vision model (box or column, per profile). */
-  async describe(image: Buffer, goal: string, target: TargetSpec | null): Promise<SceneResult> {
-    return this.opts.vision.grounding === "box" ? this.describeBox(image, goal, target) : this.describeColumns(image, goal, target);
+  /**
+   * Scene summary, the target's box and the doorways of one frame. With `waypoint` (the text of
+   * an opening chosen earlier, box models only) the same call also looks for that opening.
+   */
+  async describe(image: Buffer, goal: string, target: TargetSpec | null, waypoint?: string): Promise<SceneResult> {
+    return this.opts.vision.grounding === "box"
+      ? this.describeBox(image, goal, target, waypoint)
+      : this.describeColumns(image, goal, target);
   }
 
-  private async describeBox(image: Buffer, goal: string, target: TargetSpec | null): Promise<SceneResult> {
+  private async describeBox(image: Buffer, goal: string, target: TargetSpec | null, waypoint?: string): Promise<SceneResult> {
     const url = await toVisionJpeg(image, this.opts.vision.width, false);
+    const withWaypoint = !!target && !!waypoint;
     const schema =
       '{"summary": string (one or two sentences: layout, obstacles, free space, openings)' +
       (target
         ? ', "target": {"visible": boolean, "bbox": [x1, y1, x2, y2] or null}, "doorways": [[x1, y1, x2, y2], ...] ' +
           "(interior doorways, open doors or corridors leading to another room of the house; not windows, glass walls or doors to the outside; [] if none)"
         : "") +
+      (withWaypoint ? ', "waypoint": {"visible": boolean, "bbox": [x1, y1, x2, y2] or null}' : "") +
       "}";
     const content = await this.ask(
       [
@@ -295,6 +310,10 @@ export class Perception {
                     "Coordinates are fractions of the image width and height: 0.0 = left/top edge, 1.0 = right/bottom edge " +
                     "(e.g. [0.12, 0.40, 0.25, 0.61]). "
                   : "") +
+                (withWaypoint
+                  ? `The robot is heading for this opening, chosen earlier: "${waypoint}". Report it as waypoint, with the ` +
+                    "box of the passage itself (its floor-level gap), if it is visible in this frame. "
+                  : "") +
                 `Return JSON: ${schema}`,
             },
             { type: "image_url", image_url: { url } },
@@ -302,7 +321,7 @@ export class Perception {
         },
       ],
       500,
-      boxReplySchema(target !== null),
+      boxReplySchema(target !== null, withWaypoint),
     );
     const parsed = parseJsonObject(content);
     const summary = typeof parsed?.["summary"] === "string" ? parsed["summary"] : "Vision response was not valid JSON.";
@@ -314,10 +333,19 @@ export class Perception {
       .filter((b): b is BBoxNorm => b !== null);
     // A frame "full of doorways" is the model guessing, not seeing: drop it.
     const doorwayBearingsDeg = doorways.length <= MAX_DOORWAYS_PER_FRAME ? doorways.map(centreBearing) : [];
+    const boxObservation = (raw: unknown): TargetObservation => {
+      const o = (raw ?? {}) as Record<string, unknown>;
+      const b = o["visible"] === true ? normalizeBox(o["bbox"]) : null;
+      return b
+        ? { visible: true, source: "vlm", localization: "box", bearing_deg: centreBearing(b), bbox: b, height_frac: round(b.y_max - b.y_min) }
+        : { visible: false, source: "vlm", localization: "box" };
+    };
+    const waypointObs = withWaypoint ? boxObservation(parsed?.["waypoint"]) : null;
     const t = (parsed?.["target"] ?? {}) as Record<string, unknown>;
     const bbox = t["visible"] === true ? normalizeBox(t["bbox"]) : null;
-    if (!bbox) return { summary, target: { visible: false, source: "vlm", localization: "box" }, doorwayBearingsDeg };
+    if (!bbox) return { summary, target: { visible: false, source: "vlm", localization: "box" }, doorwayBearingsDeg, waypoint: waypointObs };
     return {
+      waypoint: waypointObs,
       summary,
       target: {
         visible: true,
@@ -409,8 +437,9 @@ export class Perception {
    * way got closer to the target's room in 58% of the cases (74% for rooms behind a passage),
    * against 38% (21%) for the most open direction.
    */
-  async chooseExploreView(views: TurnView[], target: TargetSpec): Promise<ExploreChoice | null> {
-    if (views.length < 2 || !this.opts.vision.structuredOutput) return null;
+  async chooseExploreView(views: TurnView[], target: TargetSpec, memory = ""): Promise<ExploreChoice | null> {
+    // Models without structured output reply in prompt-only JSON (parseJsonObject).
+    if (views.length < 2) return null;
     const content = await this.ask(
       [
         {
@@ -426,9 +455,17 @@ export class Perception {
                 "toward to find it? Think about which room each view shows and where doorways, corridors or passages lead: e.g. a " +
                 "bed is in a bedroom, usually reached through a doorway or corridor; a refrigerator is in the kitchen. Glass doors " +
                 "and windows cannot be walked through. Choose an explored view only if no other view can lead to the target. " +
+                // Offline on 3 turns of the house (bed target, west passage): direction error 39 / 32 / 129 deg
+                // with this rule, 159 / 60 / 127 without (the bed seen through a glass partition pulled the choice).
+                "If the target can be seen through glass or a window in some view, do not walk toward the glass: choose the " +
+                "open doorway or passage next to it that leads into that room. The opening must be a gap at floor level the " +
+                "robot can walk through, not just open floor. " +
+                (memory ? `What the robot saw so far, oldest first (prefer places it has not been to yet): ${memory} ` : "") +
                 'Return JSON: {"reason": string (one or two sentences), "view": <view number>, "x": number (horizontal position ' +
                 "in the chosen view of the doorway, passage or free floor to walk toward, as a fraction of that view's width: " +
-                "0.0 = its left edge, 1.0 = its right edge)}",
+                "0.0 = its left edge, 1.0 = its right edge), " +
+                '"opening": string (that doorway or passage described so that it can be recognized again from a few meters ' +
+                'away, with its colour and the furniture next to it, e.g. "open white door left of the tall bookshelf")}',
             },
             { type: "image_url", image_url: { url: await turnMosaic(views) } },
           ],
@@ -441,7 +478,48 @@ export class Perception {
     const view = Number(parsed?.["view"]);
     const x = Number(parsed?.["x"]);
     if (!Number.isInteger(view) || view < 0 || view >= views.length || !Number.isFinite(x)) return null;
-    return { view, x: Math.min(1, Math.max(0, x)), reason: String(parsed?.["reason"] ?? "") };
+    return {
+      view,
+      x: Math.min(1, Math.max(0, x)),
+      reason: String(parsed?.["reason"] ?? ""),
+      opening: typeof parsed?.["opening"] === "string" ? parsed["opening"].trim() : "",
+    };
+  }
+
+  /**
+   * The target is in view but the robot cannot walk straight to it (glass wall, window, long
+   * furniture): which visible doorway or passage leads to it. One call; null when the model sees
+   * none, and then the path is reported as blocked.
+   */
+  async chooseRouteOpening(image: Buffer, target: TargetSpec): Promise<{ opening: string; bbox: BBoxNorm; reason: string } | null> {
+    if (this.opts.vision.grounding !== "box") return null;
+    const url = await toVisionJpeg(image, this.opts.vision.width, false);
+    const content = await this.ask(
+      [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                `A quadruped robot sees ${targetText(target)} in this image but cannot walk straight to it: a glass wall, ` +
+                "a window, a railing or furniture is in between. Which doorway or passage visible in this image can the robot " +
+                "walk through to reach it? Glass doors that are closed, windows and gaps narrower than 0.6 m do not count. " +
+                "Coordinates are fractions of the image width and height (0.0 = left/top edge, 1.0 = right/bottom edge). " +
+                'Return JSON: {"reason": string, "opening": string (that passage described so that it can be recognized again ' +
+                'from a few meters away, with its colour and what is next to it) or null, "bbox": [x1, y1, x2, y2] of the passage or null}',
+            },
+            { type: "image_url", image_url: { url } },
+          ],
+        },
+      ],
+      400,
+    );
+    const parsed = parseJsonObject(content);
+    const bbox = normalizeBox(parsed?.["bbox"]);
+    const opening = typeof parsed?.["opening"] === "string" ? parsed["opening"].trim() : "";
+    if (!bbox || !opening) return null;
+    return { opening, bbox, reason: String(parsed?.["reason"] ?? "") };
   }
 
   async dispose(): Promise<void> {

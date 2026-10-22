@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chooseHeading, driveCommand, freeAlong, scanPoints, type ScanPoint } from "../drive.js";
+import { beamCount, chooseHeading, decodeRanges, driveCommand, freeAlong, scanPoints, scanProgress, type ScanPoint } from "../drive.js";
 
 const PARAMS = { halfWidthM: 0.25, maxHeadingDeg: 60, stepDeg: 5, lookaheadM: 3, minFreeM: 0.45, wantedFreeM: 1.5 };
 const COMMAND = { maxLinear: 0.25, maxAngular: 0.5, turnGain: 1.5, turnInPlaceDeg: 35, stopClearanceM: 0.35, slowDownM: 0.6 };
@@ -51,4 +51,28 @@ test("driveCommand turns in place for large errors and stops before obstacles", 
   assert.equal(driveCommand(0, 3, 1, COMMAND).linear, 0.25);
   assert.ok(driveCommand(0, 0.65, 1, COMMAND).linear < 0.25);
   assert.equal(driveCommand(0, 3, 0, COMMAND).linear, 0);
+});
+
+test("scanProgress is the median shortening of the ranges ahead, null without enough beams", () => {
+  const n = 181;
+  const scan = (shift: number) => ({
+    ranges: Array.from({ length: n }, (_, i) => (Math.abs(i - 90) <= 30 ? 3 - shift : Infinity)),
+    angle_min: -Math.PI / 2,
+    angle_increment: Math.PI / 180,
+  });
+  assert.ok(Math.abs(scanProgress(scan(0), scan(0.5))! - 0.5) < 1e-9);
+  assert.equal(scanProgress(scan(0), scan(0))!, 0);
+  const empty = { ranges: new Array(n).fill(Infinity), angle_min: -Math.PI / 2, angle_increment: Math.PI / 180 };
+  assert.equal(scanProgress(empty, empty), null);
+});
+
+test("decodeRanges reads float32 ranges delivered as raw bytes, and passes numbers through", () => {
+  const values = [1.5, Number.NaN, Infinity, 0.42];
+  const bytes = new Uint8Array(new Float32Array(values).buffer);
+  const decoded = decodeRanges(bytes, 4);
+  assert.ok(Math.abs(decoded[0]! - 1.5) < 1e-6 && Number.isNaN(decoded[1]!) && decoded[2] === Infinity && Math.abs(decoded[3]! - 0.42) < 1e-6);
+  assert.deepEqual(decodeRanges(Array.from(bytes), 4).map((v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : v)), [1.5, NaN, Infinity, 0.42]);
+  assert.deepEqual(decodeRanges(new Float32Array([2, 3]), 2), [2, 3]);
+  assert.deepEqual(decodeRanges([2, 3], 2), [2, 3]);
+  assert.equal(beamCount(-Math.PI, Math.PI - Math.PI / 360, Math.PI / 360), 720);
 });

@@ -82,6 +82,8 @@ export interface DriveResult {
   turnedDeg: number;
   headingDeg: number | null;
   frontFreeM: number;
+  /** Forward progress measured from the scans (m); null when it cannot be told (open space, a turn). */
+  progressM: number | null;
 }
 
 /** Estimated pose of the robot (ros2_robot_pose): localization, never the simulator ground truth. */
@@ -238,7 +240,7 @@ export class RobotTools {
    * One reactive drive slice toward a bearing of the body frame (ros2_drive_toward): free heading
    * closest to the bearing in the latest obstacle scan, stop before obstacles. No pose estimate.
    */
-  async driveToward(bearingDeg: number, meters: number, durationS: number): Promise<DriveResult> {
+  async driveToward(bearingDeg: number, meters: number, durationS: number, stopClearanceM?: number): Promise<DriveResult> {
     if (this.aborted) throw new Error("motion aborted");
     const { text, isError } = await this.call("ros2_drive_toward", {
       bearing_deg: Math.round(bearingDeg * 10) / 10,
@@ -249,10 +251,12 @@ export class RobotTools {
       max_angular: this.opts.maxAngular,
       turn_efficiency: this.opts.turnEfficiency,
       forward_efficiency: this.opts.forwardEfficiency,
+      ...(stopClearanceM != null ? { stop_clearance_m: Math.round(stopClearanceM * 100) / 100 } : {}),
     });
     try {
       const r = JSON.parse(text.slice(text.indexOf("{"))) as {
         status?: string; advanced_m?: number; turned_deg?: number; heading_deg?: number | null; front_free_m?: number;
+        progress_m?: number | null;
       };
       return {
         ok: !isError,
@@ -261,10 +265,19 @@ export class RobotTools {
         turnedDeg: r.turned_deg ?? 0,
         headingDeg: r.heading_deg ?? null,
         frontFreeM: r.front_free_m ?? 0,
+        progressM: typeof r.progress_m === "number" ? r.progress_m : null,
       };
     } catch {
-      return { ok: false, status: "failed", advancedM: 0, turnedDeg: 0, headingDeg: null, frontFreeM: 0 };
+      return { ok: false, status: "failed", advancedM: 0, turnedDeg: 0, headingDeg: null, frontFreeM: 0, progressM: null };
     }
+  }
+
+  /** True when a message arrives on the topic within timeoutMs (ros2_subscribe_once). */
+  async topicAlive(topic: string, type: string, timeoutMs = 3000): Promise<boolean> {
+    const { text, isError } = await this.call("ros2_subscribe_once", { topic, type, timeout: timeoutMs }, timeoutMs + 5000).catch(
+      () => ({ text: "", isError: true }),
+    );
+    return !isError && !/timeout|timed out|no message/i.test(text);
   }
 
   /** Walk backwards (no rear sensing: short distances only, to free the body). */

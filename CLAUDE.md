@@ -87,6 +87,7 @@ ros2_ws/src/
 | `safety.ts` | Velocity clamps applied before every publish |
 | `depth.ts` | Depth image sampling; `getDepthCorridor`: nearest obstacle in a 3D corridor in front of the body (level camera, planar depth) |
 | `tools.ts` (Nav2) | `ros2_robot_pose` (`readCurrentMapPose`: `AGENTICROS_POSE_TOPIC`, nav_msgs/Odometry by default, then `/amcl_pose`, `/pose`) and `ros2_navigate_to_pose` (`executeNavigateToPose` in core, the `navigate_to` capability; `ros2_estop` cancels it) |
+| `drive.ts` | Pure helpers of `ros2_drive_toward` (branch mapless): `decodeRanges` (LaserScan ranges can arrive as raw float32 bytes through the transport), `chooseHeading` (free heading closest to the bearing in the instantaneous scan), `driveCommand`, `scanProgress` (forward progress from two scans, no odometry) |
 | `imu-yaw.ts` | `ros2_imu_yaw`: heading change integrated from the IMU gyroscope (angular velocity projected on the vertical with roll and pitch; the absolute yaw is never used, in simulation it is the ground truth). Subscribes with a 500-message queue: with the default 10, messages were lost while the server converted a camera frame and the heading was off by up to 27° after 720° |
 
 After editing it, rebuild with `pnpm --filter @agenticros/claude-code build`: both the MCP server and the Nebius agent run it from `dist/`.

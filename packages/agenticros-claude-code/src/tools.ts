@@ -44,7 +44,7 @@ import {
 } from "@agenticros/core";
 import { getMissionRegistry } from "./mission-registry.js";
 import { startMotionDebug } from "./motion-debug.js";
-import { chooseHeading, driveCommand, scanPoints, type ScanPoint } from "./drive.js";
+import { beamCount, chooseHeading, decodeRanges, driveCommand, scanPoints, scanProgress, type ScanPoint } from "./drive.js";
 import {
   ROS_MSG_COMPRESSED_IMAGE,
   ROS_MSG_IMAGE,
@@ -1984,11 +1984,14 @@ export async function handleToolCall(
       if (timedMotionAborted) {
         return { content: [{ type: "text", text: "Motion refused: the AgenticROS server is shutting down." }], isError: true };
       }
-      let latest: { points: ScanPoint[]; at: number } | null = null;
+      type RawScan = { ranges: number[]; angle_min: number; angle_increment: number };
+      let latest: { points: ScanPoint[]; raw: RawScan; at: number } | null = null;
       const sub = transport.subscribe({ topic: scanTopic, type: "sensor_msgs/msg/LaserScan" }, (msg) => {
-        const m = msg as { ranges?: ArrayLike<number>; angle_min?: number; angle_increment?: number; range_max?: number };
+        const m = msg as { ranges?: ArrayLike<number>; angle_min?: number; angle_max?: number; angle_increment?: number; range_max?: number };
         if (!m.ranges || !Number.isFinite(m.angle_min) || !Number.isFinite(m.angle_increment)) return;
-        latest = { points: scanPoints({ ranges: Array.from(m.ranges), angle_min: m.angle_min!, angle_increment: m.angle_increment!, range_max: m.range_max }), at: Date.now() };
+        const count = beamCount(m.angle_min!, Number(m.angle_max), m.angle_increment!);
+        const raw = { ranges: decodeRanges(m.ranges, count), angle_min: m.angle_min!, angle_increment: m.angle_increment! };
+        latest = { points: scanPoints({ ...raw, range_max: m.range_max }), raw, at: Date.now() };
       });
       let finishTracking!: () => void;
       const tracked = new Promise<void>((resolve) => { finishTracking = resolve; });
@@ -1999,8 +2002,12 @@ export async function handleToolCall(
       let turnedDeg = 0;
       let advancedM = 0;
       let last = { headingDeg: null as number | null, frontFreeM: 0 };
+      let firstScan: RawScan | null = null;
+      let firstAt = 0;
       try {
         while (!latest && Date.now() - startedAt < 1000) await new Promise((r) => setTimeout(r, 20));
+        firstScan = (latest as { raw: RawScan } | null)?.raw ?? null;
+        firstAt = (latest as { at: number } | null)?.at ?? 0;
         const deadline = startedAt + durationS * 1000;
         let tick = Date.now();
         while (Date.now() < deadline) {
@@ -2035,6 +2042,10 @@ export async function handleToolCall(
         activeTimedMotions.delete(tracked);
         finishTracking();
       }
+      // Measured from the scans, not the commands: a leg caught on a rug edge or a frame the
+      // scan band misses (in simulation, 4.4 m commanded toward a bed that stayed 2.8 m away).
+      const lastScan = (latest as { raw: RawScan } | null)?.raw ?? null;
+      const progressM = firstScan && lastScan && Math.abs(turnedDeg) < 10 ? scanProgress(firstScan, lastScan) : null;
       const ok = status === "done" || status === "slice_end";
       return {
         content: [{
@@ -2046,6 +2057,9 @@ export async function handleToolCall(
             turned_deg: Math.round(turnedDeg * 10) / 10,
             heading_deg: last.headingDeg,
             front_free_m: Math.round(last.frontFreeM * 100) / 100,
+            progress_m: progressM != null ? Math.round(progressM * 100) / 100 : null,
+            scan_span_s: Math.round((((latest as { at: number } | null)?.at ?? 0) - firstAt) / 100) / 10,
+            beams: firstScan?.ranges.length ?? 0,
             elapsed_s: Math.round((Date.now() - startedAt) / 100) / 10,
           }),
         }],

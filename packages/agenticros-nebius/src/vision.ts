@@ -109,7 +109,7 @@ export function normalizeBox(raw: unknown): BBoxNorm | null {
 }
 
 /** JSON schema of the box-grounding reply (response_format json_schema). */
-export function boxReplySchema(withTarget: boolean): Record<string, unknown> {
+export function boxReplySchema(withTarget: boolean, withWaypoint = false): Record<string, unknown> {
   const box = { type: "array", items: { type: "number" }, minItems: 4, maxItems: 4 };
   const properties: Record<string, unknown> = { summary: { type: "string" } };
   const required = ["summary"];
@@ -122,6 +122,15 @@ export function boxReplySchema(withTarget: boolean): Record<string, unknown> {
     };
     properties["doorways"] = { type: "array", items: box };
     required.push("target", "doorways");
+  }
+  if (withWaypoint) {
+    properties["waypoint"] = {
+      type: "object",
+      properties: { visible: { type: "boolean" }, bbox: { anyOf: [box, { type: "null" }] } },
+      required: ["visible", "bbox"],
+      additionalProperties: false,
+    };
+    required.push("waypoint");
   }
   return { type: "object", properties, required, additionalProperties: false };
 }

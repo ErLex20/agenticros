@@ -746,3 +746,24 @@ test("currentViewExplore: a full turn comes first", () => {
   const plan = planIntent({ kind: "explore" }, obs({ front_clearance_m: 3, doorway_bearings_deg: [0] }), { ...LIMITS, currentViewExplore: true }, search);
   assert.equal(plan.ok, false);
 });
+
+test("reactiveDrive: little free space seen by the camera does not refuse the approach or start a blocked detour", () => {
+  const limits = { ...LIMITS, reactiveDrive: true };
+  const search = newSearchState(1);
+  const near = obs({ target: { visible: true, source: "yolo", confidence: 0.9, bearing_deg: 2, distance_m: 3.4, height_frac: 0.2 }, front_clearance_m: 0.5 });
+  recordObservation(search, near, limits);
+  assert.equal(search.detour, null);
+  const plan = planIntent({ kind: "approach_target" }, near, limits, search);
+  assert.ok(plan.ok && plan.action.kind === "advance" && plan.action.meters >= 1);
+});
+
+test("currentViewExplore: giving up is refused while search or explore is still possible", () => {
+  const limits = { ...LIMITS, currentViewExplore: true };
+  const search = newSearchState(1);
+  search.searchedDeg = 500;
+  const open = obs({ front_clearance_m: 3, doorway_bearings_deg: [0] });
+  assert.equal(planIntent({ kind: "finish", success: false, message: "" }, open, limits, search).ok, false);
+  search.explorations = limits.maxExplorations;
+  search.searchedDeg = 3 * 360;
+  assert.equal(planIntent({ kind: "finish", success: false, message: "" }, obs({ front_clearance_m: 0.3 }), limits, search).ok, true);
+});
