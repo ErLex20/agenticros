@@ -9,7 +9,7 @@ import { GoalAgent } from "./agent.js";
 import { Perception, type PerceptionMode } from "./perception.js";
 import { DEFAULT_LIMITS } from "./policy.js";
 import { RobotTools } from "./robot.js";
-import { visionProfile, type Grounding } from "./vision.js";
+import { visionProfile, type Grounding, type VisionProfile } from "./vision.js";
 
 const DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1/";
 const DEFAULT_REASONING_MODEL = "nvidia/Nemotron-3_5-Lightning";
@@ -39,6 +39,24 @@ function envPositive(name: string, fallback: number, max = Number.POSITIVE_INFIN
   const value = envNumber(name, fallback);
   if (!(value > 0) || value > max) throw new Error(`${name} must be in (0, ${max}], got ${value}`);
   return value;
+}
+
+/**
+ * Fallback vision model (NEBIUS_FALLBACK_VISION_MODEL, default nvidia/Nemotron-3.5-Super-VL; empty:
+ * none). Only a model with the same grounding as the primary one: the prompts depend on it.
+ */
+function fallbackVisionOptions(primary: string, vision: VisionProfile): { fallbackVisionModel?: string; fallbackVision?: VisionProfile } {
+  const model = process.env.NEBIUS_FALLBACK_VISION_MODEL !== undefined
+    ? envString("NEBIUS_FALLBACK_VISION_MODEL")
+    : "nvidia/Nemotron-3.5-Super-VL";
+  if (!model || model === primary) return {};
+  const profile = visionProfile(model);
+  if (profile.grounding !== vision.grounding) {
+    process.stderr.write(`[Perception] fallback vision model ${model} ignored: ${profile.grounding} grounding, the primary uses ${vision.grounding}\n`);
+    return {};
+  }
+  process.stderr.write(`[Perception] fallback vision model: ${model}\n`);
+  return { fallbackVisionModel: model, fallbackVision: profile };
 }
 
 function envChoice<T extends string>(name: string, allowed: readonly T[]): T | undefined {
@@ -92,6 +110,9 @@ async function main(): Promise<void> {
     imuTopic: envString("NEBIUS_IMU_TOPIC"),
     exploreAction: envString("NEBIUS_EXPLORE_ACTION"),
     scanTopic: envString("NEBIUS_SCAN_TOPIC"),
+    // "off": ros2_drive_toward slices from here instead of the robot's ReactiveDrive action.
+    reactiveAction: envString("NEBIUS_REACTIVE_DRIVE_ACTION"),
+    reactiveMaxLinear: envString("NEBIUS_REACTIVE_MAX_LINEAR") ? envPositive("NEBIUS_REACTIVE_MAX_LINEAR", 0.5) : undefined,
   });
   process.stderr.write(
     robot.opts.imuTopic
@@ -130,6 +151,7 @@ async function main(): Promise<void> {
     hfovDeg,
     minConfidence: envNumber("NEBIUS_DETECTION_MIN_CONFIDENCE", 0.35),
     verifyBelowConfidence: strongConfidence,
+    ...fallbackVisionOptions(visionModel, vision),
   });
   const agent = new GoalAgent(api, robot, perception, {
     reasoningModel: envString("NEBIUS_REASONING_MODEL") ?? DEFAULT_REASONING_MODEL,
@@ -173,7 +195,14 @@ async function main(): Promise<void> {
     robot
       .estop()
       .catch((error: unknown) => {
-        process.stderr.write(`[AgenticROS] estop failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        const message = error instanceof Error ? error.message : String(error);
+        // A terminal Ctrl-C reaches the MCP server too: it stops the robot (and cancels Nav2
+        // goals) on its own and closes the connection before answering this estop.
+        process.stderr.write(
+          /connection closed/i.test(message)
+            ? "[AgenticROS] robot stopped by the MCP server on the same signal\n"
+            : `[AgenticROS] estop failed: ${message}\n`,
+        );
       })
       .finally(() => process.exit(130));
   };

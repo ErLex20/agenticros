@@ -1,0 +1,33 @@
+# Reactive drive toward what the camera sees, with no pose estimate (go2_real reactive_drive):
+# the target is followed as a cluster of points of the instantaneous obstacle scan, seeded by
+# the bearing and distance from the vision model; a new goal replaces the running one without
+# stopping the robot (the agent re-aims after each observation).
+
+# Goal
+uint8 MODE_TARGET=0     # reach the target: stop at stop_distance_m (camera to target)
+uint8 MODE_HEADING=1    # drive toward bearing_deg for distance_m (doorways, exploration)
+uint8 mode
+float32 bearing_deg     # body frame, positive = left
+float32 distance_m      # target distance from the camera (TARGET, NaN = unknown) or distance budget (HEADING)
+float32 stop_distance_m # TARGET: camera-to-target distance to stop at
+float32 max_linear      # m/s, 0 = node default
+float32 max_angular     # rad/s, 0 = node default
+float32 timeout_s       # 0 = node default
+---
+# Result
+# arrived, done (HEADING budget covered), lost, blocked, stuck, timeout, no_scan, client_lost, canceled, preempted
+string status
+float32 bearing_deg     # last tracked bearing of the target (TARGET)
+float32 range_m         # last tracked camera-to-target distance (TARGET), NaN when unknown
+float32 progress_m      # forward progress measured from the scan, NaN when it cannot be told
+float32 commanded_m     # forward distance commanded (times forward_efficiency), with the goals it preempted
+float32 turned_deg      # rotation commanded (times turn_efficiency), positive = left, same
+float32 elapsed_s
+---
+# Feedback
+string state            # tracking, far, searching_track, turning, blocked
+float32 bearing_deg
+float32 range_m
+float32 front_free_m
+float32 linear
+float32 angular

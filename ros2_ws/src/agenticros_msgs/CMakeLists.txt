@@ -23,6 +23,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/FollowMeGetStatus.srv"
   "srv/FollowMeSetTarget.srv"
   "action/Explore.action"
+  "action/ReactiveDrive.action"
   DEPENDENCIES std_msgs builtin_interfaces geometry_msgs action_msgs
 )
 

@@ -8,6 +8,7 @@ import type {
   Mission,
   MissionToolDispatcher,
   ResolvedRobot,
+  RosTransport,
 } from "@agenticros/core";
 import {
   resolveCameraSubscribeTopic,
@@ -660,6 +661,32 @@ export const TOOLS: McpTool[] = [
     },
   },
   {
+    name: "ros2_reactive_drive",
+    description:
+      "Reactive drive executed on the robot (agenticros_msgs/action/ReactiveDrive, no pose estimate): op=start sends " +
+      "a goal and returns at once (a new start replaces the running goal without stopping the robot), op=status " +
+      "returns the latest feedback or the result, op=cancel stops. mode=target: walk to the object seen at " +
+      "bearing_deg / distance_m from the camera, tracked in the obstacle scan, stopping at stop_distance_m; " +
+      "mode=heading: walk distance_m toward bearing_deg. Results: arrived, done, lost, blocked, stuck, timeout, " +
+      "no_scan, canceled, preempted. ros2_estop cancels it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        op: { type: "string", description: "start (default), status or cancel." },
+        mode: { type: "string", description: "target (default) or heading (op=start)." },
+        bearing_deg: { type: "number", description: "Direction from the camera, body frame, degrees, positive = left." },
+        distance_m: { type: "number", minimum: 0, maximum: 15, description: "Camera-to-target distance (target, 0 = unknown) or distance to walk (heading)." },
+        stop_distance_m: { type: "number", minimum: 0, maximum: 5, description: "Target mode: stop at this camera-to-target distance (default 1.0)." },
+        timeout_s: { type: "number", minimum: 1, maximum: 120, description: "Goal timeout (default 30)." },
+        max_linear: { type: "number", description: "m/s, clamped to the safety limit." },
+        max_angular: { type: "number", description: "rad/s, clamped to the safety limit." },
+        wait_s: { type: "number", minimum: 0, maximum: 10, description: "Wait up to this long for the result before returning (default 0.2)." },
+        action: { type: "string", description: "Action name (default AGENTICROS_REACTIVE_DRIVE_ACTION or /dottorcane/agent/reactive_drive)." },
+        robot_id: { type: "string", description: "Optional robot id (from ros2_list_robots) to scope this call. When omitted, the active robot is used." },
+      },
+    },
+  },
+  {
     name: "ros2_robot_pose",
     description:
       "Estimated pose of the robot in the map frame (x, y in m, yaw in rad counter-clockwise) from the " +
@@ -780,6 +807,86 @@ const activeTimedMotions = new Set<Promise<void>>();
  * its command until its own deadline (up to 3 s).
  */
 let estopGeneration = 0;
+
+/**
+ * The latest ros2_reactive_drive goal: sent without waiting for its result, so that the agent can
+ * observe while the robot walks and replace the goal (the action server preempts the old one).
+ */
+type ReactiveRun = {
+  id: number;
+  action: string;
+  mode: string;
+  sentAt: number;
+  feedback: Record<string, unknown> | null;
+  result: Record<string, unknown> | null;
+  ended: Promise<void>;
+};
+let reactiveRun: ReactiveRun | null = null;
+let reactiveSeq = 0;
+
+const REACTIVE_DRIVE_TYPE = "agenticros_msgs/action/ReactiveDrive";
+/**
+ * While a goal runs, <action>/heartbeat (std_msgs/Empty) at 5 Hz: the robot ends the goal after
+ * 1.5 s without it, so it stops when this process dies or the link drops (the ROS graph keeps a
+ * killed client matched until its discovery lease expires).
+ */
+const REACTIVE_HEARTBEAT_MS = 200;
+let reactiveHeartbeat: ReturnType<typeof setInterval> | null = null;
+
+function startReactiveHeartbeat(transport: RosTransport): void {
+  if (reactiveHeartbeat) return;
+  reactiveHeartbeat = setInterval(() => {
+    const run = reactiveRun;
+    if (!run || run.result) {
+      if (reactiveHeartbeat) clearInterval(reactiveHeartbeat);
+      reactiveHeartbeat = null;
+      return;
+    }
+    void Promise.resolve(transport.publish({ topic: `${run.action}/heartbeat`, type: "std_msgs/msg/Empty", msg: {} })).catch(() => {});
+  }, REACTIVE_HEARTBEAT_MS);
+}
+
+function reactiveAction(args: Record<string, unknown>): string {
+  if (typeof args["action"] === "string" && args["action"]) return args["action"];
+  return process.env.AGENTICROS_REACTIVE_DRIVE_ACTION || "/dottorcane/agent/reactive_drive";
+}
+
+function roundFields(values: Record<string, unknown> | null): Record<string, unknown> | null {
+  if (!values) return null;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(values)) {
+    out[k] = typeof v === "number" ? (Number.isFinite(v) ? Math.round(v * 100) / 100 : null) : v;
+  }
+  return out;
+}
+
+function reactiveReport(run: ReactiveRun | null): Record<string, unknown> {
+  if (!run) return { goal: null, status: "idle" };
+  return {
+    goal: run.id,
+    mode: run.mode,
+    status: run.result ? run.result["status"] : "running",
+    age_s: Math.round((Date.now() - run.sentAt) / 100) / 10,
+    feedback: roundFields(run.feedback),
+    result: roundFields(run.result),
+  };
+}
+
+async function waitReactive(run: ReactiveRun | null, waitS: number): Promise<void> {
+  if (!run || run.result || waitS <= 0) return;
+  await Promise.race([run.ended, new Promise((resolve) => setTimeout(resolve, waitS * 1000))]);
+}
+
+/** Cancel the running ros2_reactive_drive goal (ros2_estop). True when one was running. */
+async function cancelReactiveDrive(transport: RosTransport, timeoutMs: number): Promise<boolean> {
+  const run = reactiveRun;
+  if (!run || run.result) return false;
+  await Promise.race([
+    transport.cancelActionGoal(run.action).catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
+  return true;
+}
 
 /** Stop every in-flight ros2_move_for and wait (bounded) for its stop publishes. */
 export async function abortTimedMotion(timeoutMs = 1500): Promise<void> {
@@ -1796,6 +1903,10 @@ export async function handleToolCall(
       if (await cancelNavigation(config, robot, transport, 1200).catch(() => false)) {
         result = emergencyStopRobot(transport, robot, config);
       }
+      // Same for the reactive drive: its 20 Hz loop on the robot would keep walking.
+      if (await cancelReactiveDrive(transport, 1200).catch(() => false)) {
+        result = emergencyStopRobot(transport, robot, config);
+      }
       if (result.skipped === "no_mobile_base") {
         return {
           content: [{
@@ -2065,6 +2176,74 @@ export async function handleToolCall(
         }],
         isError: !ok,
       };
+    }
+
+    case "ros2_reactive_drive": {
+      const op = String(args["op"] ?? "start");
+      const waitS = args["wait_s"] != null && Number.isFinite(Number(args["wait_s"])) ? Math.min(10, Math.max(0, Number(args["wait_s"]))) : 0.2;
+      if (op === "status") {
+        await waitReactive(reactiveRun, waitS);
+        return { content: [{ type: "text", text: JSON.stringify(reactiveReport(reactiveRun)) }] };
+      }
+      if (op === "cancel") {
+        const canceled = await cancelReactiveDrive(transport, 1500);
+        await waitReactive(reactiveRun, 1);
+        return { content: [{ type: "text", text: JSON.stringify({ canceled, ...reactiveReport(reactiveRun) }) }] };
+      }
+      if (op !== "start") {
+        return { content: [{ type: "text", text: "op must be start, status or cancel." }], isError: true };
+      }
+      if (timedMotionAborted) {
+        return { content: [{ type: "text", text: "Motion refused: the AgenticROS server is shutting down." }], isError: true };
+      }
+      const mode = String(args["mode"] ?? "target");
+      if (mode !== "target" && mode !== "heading") {
+        return { content: [{ type: "text", text: "mode must be target or heading." }], isError: true };
+      }
+      const num = (key: string, fallback: number) => (args[key] != null && Number.isFinite(Number(args[key])) ? Number(args[key]) : fallback);
+      const bearingDeg = num("bearing_deg", NaN);
+      const distanceM = num("distance_m", 0);
+      if (!Number.isFinite(bearingDeg) || distanceM < 0 || distanceM > 15) {
+        return { content: [{ type: "text", text: "bearing_deg must be finite and distance_m within 0-15." }], isError: true };
+      }
+      const limits = resolveSafetyForRobot(config, robot);
+      const maxLinear = Math.min(num("max_linear", limits.maxLinearVelocity ?? 0.25), limits.maxLinearVelocity ?? 0.25);
+      const maxAngular = Math.min(num("max_angular", limits.maxAngularVelocity ?? 0.5), limits.maxAngularVelocity ?? 0.5);
+      const timeoutS = Math.min(120, Math.max(1, num("timeout_s", 30)));
+      const action = reactiveAction(args);
+      const run: ReactiveRun = {
+        id: ++reactiveSeq,
+        action,
+        mode,
+        sentAt: Date.now(),
+        feedback: null,
+        result: null,
+        ended: Promise.resolve(),
+      };
+      run.ended = transport
+        .sendActionGoal({
+          action,
+          actionType: REACTIVE_DRIVE_TYPE,
+          args: {
+            mode: mode === "target" ? 0 : 1,
+            bearing_deg: bearingDeg,
+            distance_m: distanceM,
+            stop_distance_m: Math.min(5, Math.max(0, num("stop_distance_m", 1.0))),
+            max_linear: maxLinear,
+            max_angular: maxAngular,
+            timeout_s: timeoutS,
+          },
+          onFeedback: (f) => { run.feedback = f as Record<string, unknown>; },
+          timeoutMs: (timeoutS + 10) * 1000,
+        })
+        .then((r) => { run.result = r.values as Record<string, unknown>; })
+        .catch((err) => { run.result = { status: "error", error: err instanceof Error ? err.message : String(err) }; });
+      reactiveRun = run;
+      startReactiveHeartbeat(transport);
+      await waitReactive(run, waitS);
+      const report = reactiveReport(run);
+      const failed = run.result != null && ["error", "rejected"].includes(String(run.result["status"]));
+      return { content: [{ type: "text", text: JSON.stringify(report) }], isError: failed };
     }
 
     case "ros2_robot_pose": {

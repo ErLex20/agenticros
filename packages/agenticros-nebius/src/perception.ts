@@ -51,7 +51,16 @@ export interface PerceptionOptions {
   minConfidence: number;
   /** YOLO detections below this confidence are checked by the vision model on a crop. */
   verifyBelowConfidence: number;
+  /**
+   * Vision model used when the primary one fails (NEBIUS_FALLBACK_VISION_MODEL), with its own
+   * profile; only one with the same grounding, since the prompts depend on it.
+   */
+  fallbackVisionModel?: string;
+  fallbackVision?: VisionProfile;
 }
+
+/** Calls served by the fallback vision model after a failure of the primary. */
+const VISION_FALLBACK_CALLS = 5;
 
 /** One view of a search turn, for choosing where to explore next. */
 export interface TurnView {
@@ -160,6 +169,8 @@ function targetText(target: TargetSpec): string {
 }
 
 export class Perception {
+  /** Calls left on the fallback vision model after a failure of the primary one. */
+  private fallbackCalls = 0;
   private detector: PersonDetector | null = null;
   /** Set once a crop matched the attributes; reused only while a single candidate is in view. */
   private verifiedOnce = false;
@@ -175,19 +186,40 @@ export class Perception {
     maxTokens: number,
     schema?: Record<string, unknown>,
   ): Promise<string> {
-    const body = {
-      model: this.opts.visionModel,
-      temperature: 0,
-      max_tokens: maxTokens,
-      messages,
-      ...(schema && this.opts.vision.structuredOutput
-        ? { response_format: { type: "json_schema" as const, json_schema: { name: "observation", schema, strict: true } } }
-        : {}),
-      ...this.opts.vision.extraBody,
-    } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
+    const request = (model: string, vision: VisionProfile, maxRetries: number) =>
+      this.api.chat.completions.create(
+        {
+          model,
+          temperature: 0,
+          max_tokens: maxTokens,
+          messages,
+          ...(schema && vision.structuredOutput
+            ? { response_format: { type: "json_schema" as const, json_schema: { name: "observation", schema, strict: true } } }
+            : {}),
+          ...vision.extraBody,
+        } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+        { timeout: VISION_TIMEOUT_MS, maxRetries },
+      );
     const startedAt = performance.now();
-    const response = await this.api.chat.completions.create(body, { timeout: VISION_TIMEOUT_MS, maxRetries: 1 });
-    process.stderr.write(`[Timing] Nebius vision: ${((performance.now() - startedAt) / 1000).toFixed(2)}s\n`);
+    const fallback = this.opts.fallbackVisionModel && this.opts.fallbackVision ? this.opts.fallbackVisionModel : null;
+    const onFallback = fallback !== null && this.fallbackCalls > 0;
+    if (onFallback) this.fallbackCalls -= 1;
+    let response;
+    let model = onFallback ? fallback : this.opts.visionModel;
+    try {
+      response = onFallback ? await request(fallback, this.opts.fallbackVision!, 1) : await request(this.opts.visionModel, this.opts.vision, 1);
+    } catch (error) {
+      // Kimi-K2.6 answered "529 System is overloaded" twice in a row on 26 October: a description
+      // request ended there. The fallback (an NVIDIA Nemotron VL) serves the next few calls.
+      if (fallback === null || onFallback) throw error;
+      process.stderr.write(
+        `[Perception] ${this.opts.visionModel} failed (${error instanceof Error ? error.message : String(error)}): retrying with ${fallback}\n`,
+      );
+      this.fallbackCalls = VISION_FALLBACK_CALLS;
+      model = fallback;
+      response = await request(fallback, this.opts.fallbackVision!, 0);
+    }
+    process.stderr.write(`[Timing] Nebius vision: ${((performance.now() - startedAt) / 1000).toFixed(2)}s (${model})\n`);
     return response.choices[0]?.message.content ?? "";
   }
 

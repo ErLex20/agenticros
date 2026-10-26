@@ -70,6 +70,24 @@ export interface RobotOptions {
    * motion is a reactive drive (ros2_drive_toward) instead of a timed advance.
    */
   scanTopic?: string;
+  /**
+   * ReactiveDrive action on the robot (NEBIUS_REACTIVE_DRIVE_ACTION, ros2_reactive_drive): with it
+   * forward motions are goals of the robot's 20 Hz loop instead of ros2_drive_toward slices.
+   */
+  reactiveAction?: string;
+  /** Speed limit sent with every ReactiveDrive goal (m/s); unset: the node's default. */
+  reactiveMaxLinear?: number;
+}
+
+/** State of the latest ReactiveDrive goal (ros2_reactive_drive). */
+export interface ReactiveState {
+  /** running, or the result: arrived, done, lost, blocked, stuck, timeout, no_scan, canceled, preempted, error. */
+  status: string;
+  feedback: { state?: string; bearing_deg?: number | null; range_m?: number | null; front_free_m?: number | null; linear?: number; angular?: number } | null;
+  result: {
+    status?: string; bearing_deg?: number | null; range_m?: number | null; progress_m?: number | null;
+    commanded_m?: number | null; turned_deg?: number | null; elapsed_s?: number | null; error?: string;
+  } | null;
 }
 
 /** Outcome of one ros2_drive_toward slice. */
@@ -269,6 +287,53 @@ export class RobotTools {
       };
     } catch {
       return { ok: false, status: "failed", advancedM: 0, turnedDeg: 0, headingDeg: null, frontFreeM: 0, progressM: null };
+    }
+  }
+
+  /**
+   * Start a ReactiveDrive goal and return at once (a running goal is replaced without stopping).
+   * target: bearing and camera distance of the target (0 = unknown), stop at stopDistanceM;
+   * heading: walk `meters` toward the bearing.
+   */
+  async reactiveStart(
+    mode: "target" | "heading",
+    bearingDeg: number,
+    meters: number,
+    opts: { stopDistanceM?: number; timeoutS?: number } = {},
+  ): Promise<ReactiveState> {
+    if (this.aborted) throw new Error("motion aborted");
+    return this.reactiveCall({
+      op: "start",
+      mode,
+      bearing_deg: Math.round(bearingDeg * 10) / 10,
+      distance_m: Math.round(Math.max(0, meters) * 100) / 100,
+      ...(opts.stopDistanceM != null ? { stop_distance_m: Math.round(opts.stopDistanceM * 100) / 100 } : {}),
+      ...(opts.timeoutS != null ? { timeout_s: opts.timeoutS } : {}),
+      ...(this.opts.reactiveMaxLinear != null ? { max_linear: this.opts.reactiveMaxLinear } : {}),
+      wait_s: 0.2,
+    });
+  }
+
+  /** Latest feedback or result of the ReactiveDrive goal, waiting up to waitS for the result. */
+  async reactiveStatus(waitS = 0.5): Promise<ReactiveState> {
+    return this.reactiveCall({ op: "status", wait_s: waitS });
+  }
+
+  /** Cancel the ReactiveDrive goal (the robot stops). */
+  async reactiveCancel(): Promise<ReactiveState> {
+    return this.reactiveCall({ op: "cancel" });
+  }
+
+  private async reactiveCall(args: Record<string, unknown>): Promise<ReactiveState> {
+    const { text } = await this.call("ros2_reactive_drive", {
+      ...args,
+      ...(this.opts.reactiveAction ? { action: this.opts.reactiveAction } : {}),
+    });
+    try {
+      const r = JSON.parse(text.slice(text.indexOf("{"))) as ReactiveState;
+      return { status: String(r.status ?? "error"), feedback: r.feedback ?? null, result: r.result ?? null };
+    } catch {
+      return { status: "error", feedback: null, result: { status: "error", error: text.slice(0, 200) } };
     }
   }
 

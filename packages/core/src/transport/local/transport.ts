@@ -64,6 +64,11 @@ export class LocalTransport implements RosTransport {
   private node: any = null;
   private entityCache: EntityCache | null = null;
   private activeGoals = new Map<string, any>();
+  /**
+   * One ActionClient per action, kept for the node's lifetime: a client created per goal waits for
+   * discovery each time (hundreds of ms), too slow for goals re-sent after every observation.
+   */
+  private actionClients = new Map<string, any>();
 
   /** Singleton guard — rclnodejs.init() must only be called once per process. */
   private static rclInitialized = false;
@@ -136,6 +141,14 @@ export class LocalTransport implements RosTransport {
       }
     }
     this.activeGoals.clear();
+    for (const client of this.actionClients.values()) {
+      try {
+        client.destroy();
+      } catch {
+        // Best-effort
+      }
+    }
+    this.actionClients.clear();
 
     if (this.entityCache && this.node) {
       this.entityCache.destroyAll(this.node);
@@ -236,17 +249,23 @@ export class LocalTransport implements RosTransport {
     this.ensureConnected();
 
     const ActionClass = loadMessageClass(options.actionType);
-    // rclnodejs resolves the action type from its "pkg/action/Name" string;
-    // passing the generated class fails with "The message required does not exist".
-    const actionClient = new (this.rclnodejs!.ActionClient as any)(
-      this.node,
-      options.actionType,
-      options.action,
-    );
+    const key = `${options.action}|${options.actionType}`;
+    let actionClient = this.actionClients.get(key);
+    if (!actionClient) {
+      // rclnodejs resolves the action type from its "pkg/action/Name" string;
+      // passing the generated class fails with "The message required does not exist".
+      actionClient = new (this.rclnodejs!.ActionClient as any)(
+        this.node,
+        options.actionType,
+        options.action,
+      );
+      this.actionClients.set(key, actionClient);
+    }
 
     // Wait for action server (5s)
     const available = await actionClient.waitForServer(5000);
     if (!available) {
+      this.actionClients.delete(key);
       actionClient.destroy();
       throw new Error(`Action server ${options.action} not available after 5 seconds`);
     }
@@ -287,7 +306,6 @@ export class LocalTransport implements RosTransport {
     } finally {
       if (timer) clearTimeout(timer);
       if (this.activeGoals.get(options.action) === goalHandle) this.activeGoals.delete(options.action);
-      actionClient.destroy();
     }
   }
 

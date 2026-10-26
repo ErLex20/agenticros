@@ -50,7 +50,7 @@ import {
   type SearchState,
   type TargetObservation,
 } from "./policy.js";
-import type { NavigationCapabilities, Place, RobotTools } from "./robot.js";
+import type { NavigationCapabilities, Place, ReactiveState, RobotTools } from "./robot.js";
 
 /**
  * Corridor straight ahead (about ±12°, roughly the body width at 1–2 m), above
@@ -60,6 +60,11 @@ import type { NavigationCapabilities, Place, RobotTools } from "./robot.js";
 const FRONT_ROI = { x_min: 0.4, y_min: 0.25, x_max: 0.6, y_max: 0.5 };
 /** Half width of the 3D corridor in front of the body checked for low obstacles (Go2 ~0.31 m wide, plus margin). */
 const CORRIDOR_HALF_WIDTH_M = 0.25;
+
+/** Crop checks in a row that confirm a sighting first seen already within arrival distance. */
+const CLOSE_SIGHTING_VERIFIED = 2;
+/** Steps of looking again at an unconfirmed target within the stop distance before giving up. */
+const MAX_LOOK_AGAIN = 3;
 
 /** Upper bound on explicit motions parsed from one request. */
 const MAX_EXPLICIT_MOVES = 8;
@@ -90,6 +95,17 @@ const DRIVE_MIN_CLEARANCE_M = 0.5;
 const BLOCKED_WAIT_S = 2;
 /** A slice that turned more than this went around something: look again before driving on. */
 const REACTIVE_DEVIATION_DEG = 10;
+
+/**
+ * ReactiveDrive goals (the robot's own loop): while it walks toward the target, look again with
+ * the vision model every REAIM_S (REAIM_TRACKED_S while the lidar tracks the target) and send the
+ * new bearing; at most MAX_REAIMS looks and ACTION_DRIVE_MAX_S per drive, then the next standing
+ * observation of the main loop decides.
+ */
+const REAIM_S = 2;
+const REAIM_TRACKED_S = 4;
+const MAX_REAIMS = 5;
+const ACTION_DRIVE_MAX_S = 30;
 
 /** Budget of the request parsing call (s): longer than a step decision, without retries. */
 const GOAL_TIMEOUT_S = 30;
@@ -367,12 +383,16 @@ export class GoalAgent {
   /** What the robot saw at each place and which opening it took: text memory for the next choices. */
   private placeLog: string[] = [];
   private turnScenes: { turnId: number; scenes: string[] } = { turnId: -1, scenes: [] };
-  /** Navigation stack detected at the start of the run. */
-  private navigation: NavigationCapabilities = { navigate: false, explore: false };
   /** Calls left on the fallback reasoning model after a failure of the primary one. */
   private fallbackCalls = 0;
+  /** Navigation stack detected at the start of the run. */
+  private navigation: NavigationCapabilities = { navigate: false, explore: false };
   /** Map position of the target from its last far sighting (with a pose estimate). */
   private targetMap: { x: number; y: number } | null = null;
+  /** Consecutive frames in which the crop check really answered "match" (not a failed call). */
+  private verifyMatches = 0;
+  /** Consecutive steps spent looking again at an unconfirmed target within the stop distance. */
+  private lookAgain = 0;
 
   constructor(
     private readonly api: OpenAI,
@@ -390,7 +410,7 @@ export class GoalAgent {
     const startedAt = performance.now();
     // A step decision has a short budget and no retry: when the endpoint hangs (Nemotron
     // Lightning timed out for hours on 21 October) the deterministic policy takes over at
-    // once instead of after 2 x 60 s. Parsing the request keeps the client defaults.
+    // once instead of after 2 x 60 s. Parsing the request has a longer budget, also without retry.
     const options = tools
       ? { timeout: this.cfg.decisionTimeoutS * 1000, maxRetries: 0 }
       : { timeout: GOAL_TIMEOUT_S * 1000, maxRetries: 0 };
@@ -699,6 +719,8 @@ export class GoalAgent {
     if (limits.frontierExploration) limits.maxExplorations = Math.max(limits.maxExplorations, FRONTIER_MAX_EXPLORATIONS);
     const search: SearchState = newSearchState(parsed.searchDirection);
     this.targetMap = null;
+    this.verifyMatches = 0;
+    this.lookAgain = 0;
     this.waypoint = null;
     this.lastWaypoint = null;
     this.placeLog = [];
@@ -745,6 +767,13 @@ export class GoalAgent {
         if (!fullTurnSearched(search, limits)) search.searchedDeg = 360 + limits.searchStepDeg;
       }
       recordObservation(search, obs, limits);
+      if (search.closeFirstSighting && this.verifyMatches >= CLOSE_SIGHTING_VERIFIED) {
+        // A target first seen already within arrival distance is not confirmed by repetition alone
+        // (a sofa 0.37 m ahead passed for a bed), but two crop checks in a row naming it are enough:
+        // on the real Go2, started 0.9 m from a chair, the guard kept it waiting for good.
+        log(`[Verify] ${this.verifyMatches} crop checks in a row confirm the close sighting`);
+        search.closeFirstSighting = false;
+      }
       await this.suggestExploration(obs, parsed.target, search, limits);
       if (limits.currentViewExplore) this.applyWaypoint(obs, search, limits);
 
@@ -772,14 +801,20 @@ export class GoalAgent {
       if (!action) {
         const intent = autopilot(obs, limits, search);
         plan = planIntent(intent, obs, limits, search);
-        if (!plan.ok && isGoalReached(obs, limits) && !sightingConfirmed(obs, search, limits)) {
+        if (!plan.ok && isGoalReached(obs, limits) && !sightingConfirmed(obs, search, limits) && this.lookAgain < MAX_LOOK_AGAIN) {
+          this.lookAgain += 1;
           // Within the stop distance but seen in one frame only (vision-model sightings need two):
           // stay and look again instead of giving up (it ended a run 1.2 m from the target).
           log(`[Decision] target within the stop distance, not confirmed yet: looking again without moving`);
           history.push({ step, observation: summarizeObservation(obs), action: "none (look again)", outcome: "waiting for a second sighting" });
           continue;
         }
-        action = plan.ok ? plan.action : { kind: "finish", success: false, message: "Nessuna azione sicura disponibile." };
+        if (plan.ok || !isGoalReached(obs, limits)) this.lookAgain = 0;
+        action = plan.ok
+          ? plan.action
+          : isGoalReached(obs, limits)
+            ? { kind: "finish", success: false, message: "Il bersaglio sembra davanti al robot, ma non è stato confermato." }
+            : { kind: "finish", success: false, message: "Nessuna azione sicura disponibile." };
         outcome ||= "fallback policy";
         log(`[Decision] fallback ${describeIntent(intent)} -> ${describeAction(action)}`);
       } else {
@@ -854,6 +889,8 @@ export class GoalAgent {
         this.navigation.navigate && sightingConfirmed(obs, search, limits)
       ) {
         action = await this.approachWithNav2(action, obs, limits);
+      } else if (action.kind === "advance" && this.robot.opts.reactiveAction && this.robot.opts.reactiveAction !== "off") {
+        action = await this.driveWithAction(action, plan, obs, limits, goal, parsed.target);
       } else if (action.kind === "advance" && this.robot.opts.scanTopic) {
         action = await this.driveReactive(action, plan, obs, limits);
       } else {
@@ -949,6 +986,99 @@ export class GoalAgent {
       this.blockedTowardTarget = (status === "blocked" || status === "stuck") && advanced < 0.3 ? this.blockedTowardTarget + 1 : 0;
     }
     return { kind: "advance", meters: round(advanced, 2) };
+  }
+
+  /**
+   * Forward motion as a goal of the robot's ReactiveDrive action (branch mapless, no pose): the
+   * 20 Hz loop runs on the robot next to the lidar, and a new goal replaces the running one
+   * without stopping. Toward a confirmed target at a known distance it is a TARGET goal (the
+   * target followed in the obstacle scan, stop at the stop distance), re-aimed with the vision
+   * model while the robot walks; otherwise (exploration, detours, unknown distance) a HEADING goal
+   * of the planned distance. The drive ends with the action's result; the next observation of the
+   * main loop is taken standing still and decides arrival (with its crop checks), as before.
+   */
+  private async driveWithAction(
+    action: Extract<Action, { kind: "advance" }>,
+    plan: Plan | null,
+    obs: Observation,
+    limits: PolicyLimits,
+    goal: string,
+    target: TargetSpec | null,
+  ): Promise<Action> {
+    const t = obs.target;
+    const toTarget = !!plan?.ok && !plan.explore && !plan.detour && !!t?.visible && (t.localization ?? "box") === "box";
+    const known = toTarget && typeof t!.distance_m === "number" && !t!.occluded;
+    const startedAt = performance.now();
+    const seconds = () => (performance.now() - startedAt) / 1000;
+    let r: ReactiveState;
+    let aims = 0;
+    if (known) {
+      r = await this.robot.reactiveStart("target", t!.bearing_deg ?? 0, t!.distance_m as number, {
+        stopDistanceM: limits.stopDistanceM,
+        timeoutS: ACTION_DRIVE_MAX_S,
+      });
+      log(`[Drive] action: target at ${round(t!.bearing_deg ?? 0, 0)} deg, ${round(t!.distance_m as number)} m, stop at ${limits.stopDistanceM} m -> ${r.status}`);
+      let lastAim = performance.now();
+      while (r.status === "running" && seconds() < ACTION_DRIVE_MAX_S) {
+        const tracked = r.feedback?.state === "tracking" || r.feedback?.state === "turning";
+        if (aims < MAX_REAIMS && (performance.now() - lastAim) / 1000 >= (tracked ? REAIM_TRACKED_S : REAIM_S)) {
+          lastAim = performance.now();
+          aims += 1;
+          const seen = await this.locateWhileMoving(goal, target);
+          const now = await this.robot.reactiveStatus(0);
+          if (now.status !== "running") {
+            r = now;
+            break;
+          }
+          if (seen) {
+            r = await this.robot.reactiveStart("target", seen.bearingDeg, seen.distanceM ?? 0, {
+              stopDistanceM: limits.stopDistanceM,
+              timeoutS: ACTION_DRIVE_MAX_S,
+            });
+            log(
+              `[Drive] re-aim ${aims}: target at ${round(seen.bearingDeg, 0)} deg, ` +
+                `${seen.distanceM != null ? `${round(seen.distanceM)} m` : "distance unknown"} ` +
+                `(lidar: ${now.feedback?.state ?? "?"}, ${round(now.feedback?.bearing_deg ?? NaN, 0)} deg, ${round(now.feedback?.range_m ?? NaN)} m)`,
+            );
+            continue;
+          }
+          log(`[Drive] re-aim ${aims}: target not seen, the drive goes on (lidar: ${now.feedback?.state ?? "?"})`);
+        }
+        r = await this.robot.reactiveStatus(0.5);
+      }
+    } else {
+      const bearing = toTarget ? (t!.bearing_deg ?? 0) : 0;
+      r = await this.robot.reactiveStart("heading", bearing, action.meters, { timeoutS: ACTION_DRIVE_MAX_S });
+      while (r.status === "running" && seconds() < ACTION_DRIVE_MAX_S) r = await this.robot.reactiveStatus(1);
+    }
+    if (r.status === "running") r = await this.robot.reactiveCancel();
+    const res = r.result ?? {};
+    const advanced = Math.max(0, res.commanded_m ?? 0);
+    log(
+      `[Timing] AgenticROS reactive_drive(${known ? "target" : `heading ${round(action.meters)} m`}): ${elapsed(startedAt)}s -> ` +
+        `${r.status}, ${round(advanced)} m commanded, turned ${round(res.turned_deg ?? 0, 0)} deg` +
+        `${res.range_m != null ? `, target at ${round(res.range_m)} m` : ""}${aims ? `, ${aims} re-aims` : ""}` +
+        `${res.error ? ` (${res.error.slice(0, 120)})` : ""}`,
+    );
+    if (toTarget) {
+      this.blockedTowardTarget = (r.status === "blocked" || r.status === "stuck") && advanced < 0.3 ? this.blockedTowardTarget + 1 : 0;
+    }
+    return { kind: "advance", meters: round(advanced, 2) };
+  }
+
+  /**
+   * One look at the target while the robot walks (no decision, no crop check): its bearing and,
+   * when the depth agrees with the box, its distance. Null when it is not seen in a tight box.
+   */
+  private async locateWhileMoving(goal: string, target: TargetSpec | null): Promise<{ bearingDeg: number; distanceM: number | null } | null> {
+    const snapshot = await this.robot.snapshot().catch(() => null);
+    if (!snapshot) return null;
+    const scene = await this.perception.describe(snapshot.image, goal, target).catch(() => null);
+    const seen = scene?.target;
+    if (!seen?.visible || !seen.bbox || (seen.localization ?? "box") !== "box" || seen.bearing_deg == null) return null;
+    const d = await this.robot.depth(innerBox(seen.bbox)).catch(() => null);
+    const distanceM = d != null && depthConsistentWithBox(seen.bbox, d, this.cfg.camera) ? d : null;
+    return { bearingDeg: seen.bearing_deg, distanceM };
   }
 
   /**
@@ -1222,13 +1352,17 @@ export class GoalAgent {
    */
   private async checkVisionSighting(obs: Observation, target: TargetSpec | null, search: SearchState, limits: PolicyLimits): Promise<void> {
     const t = obs.target;
+    if (!t?.visible) this.verifyMatches = 0;
     if (!t?.visible || t.source !== "vlm" || !target || !this.lastImage) return;
     const confirming = search.sightingStreak + 1 === 2;
     if (!confirming && !isGoalReached(obs, limits)) return;
+    let answered = true;
     const match = await this.perception.verifyCandidate(this.lastImage, t, target, 1, true).catch((error: unknown) => {
       log(`[Verify] failed, sighting kept: ${error instanceof Error ? error.message : String(error)}`);
+      answered = false;
       return true;
     });
+    this.verifyMatches = match && answered ? this.verifyMatches + 1 : 0;
     if (!match) obs.target = { visible: false, source: "vlm", localization: t.localization ?? "box" };
   }
 
@@ -1310,15 +1444,15 @@ export class GoalAgent {
   }
 
   /**
-   * Sensors the mapless drive cannot do without, checked before anything moves: with the obstacle
-   * scan missing every forward step would end at once (no_scan), and without depth the target
-   * distance is unknown. On the robot the usual cause is go2_real.launch.py not running.
+   * Sensors checked before anything moves: with the obstacle scan (mapless drive) missing every
+   * forward step would end at once (no_scan), and without depth (on the robot, the lidar depth of
+   * go2_real.launch.py) every target distance is unknown. The usual cause is go2_real.launch.py
+   * not running.
    */
   private async preflight(): Promise<string | null> {
-    const scan = this.robot.opts.scanTopic;
-    if (!scan) return null;
     const missing: string[] = [];
-    if (!(await this.robot.topicAlive(scan, "sensor_msgs/msg/LaserScan"))) missing.push(scan);
+    const scan = this.robot.opts.scanTopic;
+    if (scan && !(await this.robot.topicAlive(scan, "sensor_msgs/msg/LaserScan"))) missing.push(scan);
     const depth = this.robot.opts.depthTopic;
     if (depth && !(await this.robot.topicAlive(depth, "sensor_msgs/msg/Image"))) missing.push(depth);
     if (!missing.length) return null;
