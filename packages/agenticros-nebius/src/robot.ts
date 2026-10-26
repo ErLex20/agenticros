@@ -217,6 +217,14 @@ export class RobotTools {
     await this.moveChunks(this.opts.maxLinear, 0, seconds);
   }
 
+  /** True when a message arrives on the topic within timeoutMs (ros2_subscribe_once). */
+  async topicAlive(topic: string, type: string, timeoutMs = 3000): Promise<boolean> {
+    const { text, isError } = await this.call("ros2_subscribe_once", { topic, type, timeout: timeoutMs }, timeoutMs + 5000).catch(
+      () => ({ text: "", isError: true }),
+    );
+    return !isError && !/timeout|timed out|no message/i.test(text);
+  }
+
   /** Walk backwards (no rear sensing: short distances only, to free the body). */
   async backUp(meters: number): Promise<void> {
     const seconds = meters / (this.opts.maxLinear * this.opts.forwardEfficiency);

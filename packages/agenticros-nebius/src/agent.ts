@@ -78,6 +78,11 @@ const MIN_NAV2_TRIP_M = 0.3;
 const NAV2_WALK_S_PER_M = 20;
 const NAV2_WALK_BASE_S = 30;
 
+/** Budget of the request parsing call (s): longer than a step decision, without retries. */
+const GOAL_TIMEOUT_S = 30;
+/** Calls served by the fallback reasoning model after a failure of the primary. */
+const FALLBACK_CALLS = 5;
+
 /** Camera ahead of the base (Go2 head, ~0.33 m), for placing a sighting in the map frame. */
 const CAMERA_FORWARD_M = 0.3;
 /** A close sighting within this distance of the remembered target position is the same target. */
@@ -137,6 +142,13 @@ export interface AgentConfig {
    * map too, since the map frame of EKF + LIO-SAM holds for the whole session.
    */
   sessionPlaces: boolean;
+  /** Time budget of one step decision of the reasoning model (s); beyond it the fallback policy decides. */
+  decisionTimeoutS: number;
+  /**
+   * Reasoning model used when the primary one fails or times out (NEBIUS_FALLBACK_REASONING_MODEL,
+   * default nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B; empty: none, the deterministic policy decides).
+   */
+  fallbackReasoningModel?: string;
 }
 
 type GoalMode = "approach" | "describe" | "move" | "stop" | "goto" | "remember";
@@ -306,6 +318,8 @@ export class GoalAgent {
   private turnViews: { turnId: number; views: { headingDeg: number; image: Buffer }[] } = { turnId: -1, views: [] };
   /** Turn for which the vision model was already asked where to explore. */
   private askedTurnId = -1;
+  /** Calls left on the fallback reasoning model after a failure of the primary one. */
+  private fallbackCalls = 0;
   /** Navigation stack detected at the start of the run. */
   private navigation: NavigationCapabilities = { navigate: false, explore: false };
   /** Map position of the target from its last far sighting (with a pose estimate). */
@@ -329,13 +343,37 @@ export class GoalAgent {
     tools?: OpenAI.Chat.Completions.ChatCompletionTool[],
   ): Promise<OpenAI.Chat.Completions.ChatCompletionMessage | undefined> {
     const startedAt = performance.now();
-    const response = await this.api.chat.completions.create({
-      model: this.cfg.reasoningModel,
-      temperature: 0,
-      messages,
-      ...(tools ? { tools, tool_choice: "auto" as const, parallel_tool_calls: false } : {}),
-    });
-    log(`[Timing] Nebius reasoning: ${elapsed(startedAt)}s`);
+    // A step decision has a short budget and no retry: when the endpoint hangs (Nemotron
+    // Lightning timed out for hours on 21 October) the deterministic policy takes over at
+    // once instead of after 2 x 60 s. Parsing the request has a longer budget, also without retry.
+    const options = tools
+      ? { timeout: this.cfg.decisionTimeoutS * 1000, maxRetries: 0 }
+      : { timeout: GOAL_TIMEOUT_S * 1000, maxRetries: 0 };
+    const request = (model: string) =>
+      this.api.chat.completions.create({
+        model,
+        temperature: 0,
+        messages,
+        ...(tools ? { tools, tool_choice: "auto" as const, parallel_tool_calls: false } : {}),
+        // The fallback Nemotron (Nano) reasons by default: 33 s to parse a request, with thinking
+        // off 0.75 s and the same JSON.
+        ...(model === this.cfg.fallbackReasoningModel ? { chat_template_kwargs: { enable_thinking: false } } : {}),
+      } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming, options);
+    // After a failure of the primary model the fallback (another NVIDIA Nemotron) serves the next
+    // few calls, then the primary is tried again.
+    const fallback = this.cfg.fallbackReasoningModel;
+    const primary = this.fallbackCalls > 0 && fallback ? fallback : this.cfg.reasoningModel;
+    if (this.fallbackCalls > 0) this.fallbackCalls -= 1;
+    let response;
+    try {
+      response = await request(primary);
+    } catch (error) {
+      if (!fallback || primary === fallback) throw error;
+      log(`[Decision] ${primary} failed (${error instanceof Error ? error.message : String(error)}): retrying with ${fallback}`);
+      this.fallbackCalls = FALLBACK_CALLS;
+      response = await request(fallback);
+    }
+    log(`[Timing] Nebius reasoning: ${elapsed(startedAt)}s (${response.model ?? primary})`);
     return response.choices[0]?.message;
   }
 
@@ -1013,7 +1051,20 @@ export class GoalAgent {
       : { ok: false, message: `Navigazione con Nav2 verso ${label} non riuscita (${nav.status}).` };
   }
 
+  /**
+   * Sensors checked before anything moves: without the depth (on the robot, the lidar depth of
+   * go2_real.launch.py) every target distance is unknown and advances are short creeps.
+   */
+  private async preflight(): Promise<string | null> {
+    const depth = this.robot.opts.depthTopic;
+    if (!depth || (await this.robot.topicAlive(depth, "sensor_msgs/msg/Image"))) return null;
+    log(`[Preflight] no messages on ${depth}`);
+    return `Sensori non disponibili (${depth}): avvia go2_real.launch.py sul robot (o la simulazione) prima dell'agente. Il robot non si è mosso.`;
+  }
+
   async run(goal: string): Promise<string> {
+    const notReady = await this.preflight();
+    if (notReady) return notReady;
     const places = await this.navigationPlaces();
     const parsed = await this.parseGoal(goal, places);
     switch (parsed.mode) {

@@ -743,6 +743,12 @@ export const TOOLS: McpTool[] = [
  */
 let timedMotionAborted = false;
 const activeTimedMotions = new Set<Promise<void>>();
+/**
+ * Incremented by every ros2_estop: a ros2_move_for in progress stops at its next cycle. Before,
+ * an estop published a zero Twist while a ros2_move_for kept publishing its command until its own
+ * deadline (up to 3 s).
+ */
+let estopGeneration = 0;
 
 /** Stop every in-flight ros2_move_for and wait (bounded) for its stop publishes. */
 export async function abortTimedMotion(timeoutMs = 1500): Promise<void> {
@@ -1407,13 +1413,14 @@ export async function handleToolCall(
       const tracked = new Promise<void>((resolve) => { finishTracking = resolve; });
       activeTimedMotions.add(tracked);
       const debug = startMotionDebug(transport, topic);
+      const generation = estopGeneration;
       let publishCount = 0;
       try {
         if (process.env.AGENTICROS_DEBUG_POSE_TOPIC) await new Promise((r) => setTimeout(r, 1000));
         debug.phase("command");
         process.stderr.write(`[MotionDebug] command topic=${topic} body vx=${linearX} vy=0 wz=${angularZ} duration=${durationSeconds}s\n`);
         const deadline = Date.now() + durationSeconds * 1000;
-        while (Date.now() < deadline && !timedMotionAborted) {
+        while (Date.now() < deadline && !timedMotionAborted && estopGeneration === generation) {
           await transport.publish({ topic, type, msg: message });
           publishCount++;
           const remaining = deadline - Date.now();
@@ -1749,6 +1756,7 @@ export async function handleToolCall(
     }
 
     case "ros2_estop": {
+      estopGeneration++;
       await stopFollowMeLocalIfPresent(robot.id);
       await stopFollowMeDepthIfPresent(robot.id);
       let result = emergencyStopRobot(transport, robot, config);
