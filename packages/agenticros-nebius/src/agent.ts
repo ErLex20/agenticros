@@ -885,6 +885,13 @@ export class GoalAgent {
     const start = await this.robot.robotPose().catch(() => null);
     const goal = start ? nav2ApproachGoal(start, obs, limits) : null;
     if (!start || !goal) {
+      // Said in the log: on the robot a missing pose (EKF odometry not arriving) looked like Nav2
+      // never being called.
+      log(
+        !start
+          ? "[Navigation] no pose estimate (AGENTICROS_POSE_TOPIC): timed advance instead of a Nav2 approach"
+          : "[Navigation] target too close, off-axis or at an unknown distance for a Nav2 goal: timed advance",
+      );
       await this.execute(action);
       return action;
     }

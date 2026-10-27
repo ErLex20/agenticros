@@ -109,6 +109,7 @@ async function main(): Promise<void> {
     forwardEfficiency: envPositive("NEBIUS_FORWARD_EFFICIENCY", 1.0, 2),
     imuTopic: envString("NEBIUS_IMU_TOPIC"),
     exploreAction: envString("NEBIUS_EXPLORE_ACTION"),
+    nav2Motion: (envChoice("NEBIUS_NAV2_MOTION", ["on", "off"] as const) ?? "off") === "on",
   });
   process.stderr.write(
     robot.opts.imuTopic

@@ -17,6 +17,10 @@ const MAX_ACTION_SECONDS = 20;
 const TOOL_TIMEOUT_MS = 30_000;
 /** A Nav2 trip across a house takes minutes at the Go2's walking speed. */
 const NAVIGATION_TIMEOUT_MS = 660_000;
+/** Nav2 behaviors (behavior_server) used for every motion with nav2Motion, next to navigate_to_pose. */
+const NAV2_BEHAVIORS = { spin: "nav2_msgs/action/Spin", backup: "nav2_msgs/action/BackUp", drive_on_heading: "nav2_msgs/action/DriveOnHeading" };
+/** Budget of a behavior goal: the nominal time at the slowest expected speed, plus this (s). */
+const BEHAVIOR_MARGIN_S = 5;
 
 /** A named pose of the map (ros2_list_places), e.g. a room. */
 export interface Place {
@@ -65,6 +69,13 @@ export interface RobotOptions {
   imuTopic?: string;
   /** Action of agenticros_explore (NEBIUS_EXPLORE_ACTION, default /explore). */
   exploreAction?: string;
+  /**
+   * Every rotate/advance/backUp as a Nav2 behavior (spin, drive_on_heading, backup) of the
+   * navigate_to_pose namespace, closed loop on the localization TF and collision-checked on the
+   * local costmap, never a cmd_vel from here (NEBIUS_NAV2_MOTION=on). Without those actions a
+   * motion is refused.
+   */
+  nav2Motion?: boolean;
 }
 
 /** Estimated pose of the robot (ros2_robot_pose): localization, never the simulator ground truth. */
@@ -99,6 +110,8 @@ function navigationResult(text: string, isError: boolean): NavigationResult {
 export class RobotTools {
   /** Set on Ctrl-C: no further motion command is sent. */
   aborted = false;
+  /** Namespace of the Nav2 behaviors (e.g. /dottorcane/dua_nav2), found with navigate_to_pose. */
+  private behaviorNamespace: string | null = null;
 
   constructor(
     private readonly mcp: Client,
@@ -205,14 +218,60 @@ export class RobotTools {
     }
   }
 
+  /**
+   * One Nav2 behavior goal (ros2_action_goal, cancelled by ros2_estop). A failure (collision ahead,
+   * timeout) is logged, not thrown: the robot stopped where it was and the next observation, with
+   * the IMU heading, sees how far it got.
+   */
+  private async behavior(name: keyof typeof NAV2_BEHAVIORS, goal: Record<string, unknown>, budgetS: number, label: string): Promise<void> {
+    if (this.aborted) throw new Error("motion aborted");
+    if (!this.behaviorNamespace) {
+      throw new Error(
+        `Nav2 behaviors (spin, drive_on_heading, backup) not found: ${label} refused, the agent never publishes cmd_vel ` +
+          "itself (start dua_nav2 before the agent, or NEBIUS_NAV2_MOTION=off for timed cmd_vel motions)",
+      );
+    }
+    const startedAt = performance.now();
+    const seconds = Math.ceil(budgetS);
+    const { text, isError } = await this.call(
+      "ros2_action_goal",
+      { action: `${this.behaviorNamespace}/${name}`, actionType: NAV2_BEHAVIORS[name], goal: { ...goal, time_allowance: { sec: seconds, nanosec: 0 } } },
+      (seconds + 15) * 1000,
+    );
+    let outcome = isError ? text.slice(0, 160) : "failed";
+    try {
+      const r = JSON.parse(text.slice(text.indexOf("{"))) as {
+        success?: boolean;
+        result?: { status?: string; error_msg?: string; distance_traveled?: number; angular_distance_traveled?: number };
+      };
+      const done = r.result?.distance_traveled ?? r.result?.angular_distance_traveled;
+      outcome = `${r.result?.status ?? (r.success ? "succeeded" : "failed")}` +
+        (typeof done === "number" ? `, ${name === "spin" ? `${Math.round((done * 180) / Math.PI)} deg` : `${done.toFixed(2)} m`}` : "") +
+        (r.result?.error_msg ? ` (${r.result.error_msg})` : "");
+    } catch {
+      // keep the raw outcome
+    }
+    process.stderr.write(`[Motion] Nav2 ${name} ${label}: ${outcome} in ${((performance.now() - startedAt) / 1000).toFixed(1)} s\n`);
+  }
+
   /** Rotate in place; positive degrees turn left (counter-clockwise). */
   async rotate(degrees: number): Promise<void> {
+    if (this.opts.nav2Motion) {
+      const yaw = (degrees * Math.PI) / 180;
+      await this.behavior("spin", { target_yaw: yaw }, Math.abs(yaw) / (0.5 * this.opts.maxAngular) + BEHAVIOR_MARGIN_S, `${Math.round(degrees)} deg`);
+      return;
+    }
     const radians = (Math.abs(degrees) * Math.PI) / 180;
     const seconds = radians / (this.opts.maxAngular * this.opts.turnEfficiency);
     await this.moveChunks(0, Math.sign(degrees) * this.opts.maxAngular, seconds);
   }
 
   async advance(meters: number): Promise<void> {
+    if (this.opts.nav2Motion) {
+      const speed = this.opts.maxLinear;
+      await this.behavior("drive_on_heading", { target: { x: meters, y: 0, z: 0 }, speed }, (2 * meters) / speed + BEHAVIOR_MARGIN_S, `${meters.toFixed(2)} m`);
+      return;
+    }
     const seconds = meters / (this.opts.maxLinear * this.opts.forwardEfficiency);
     await this.moveChunks(this.opts.maxLinear, 0, seconds);
   }
@@ -227,6 +286,11 @@ export class RobotTools {
 
   /** Walk backwards (no rear sensing: short distances only, to free the body). */
   async backUp(meters: number): Promise<void> {
+    if (this.opts.nav2Motion) {
+      const speed = this.opts.maxLinear;
+      await this.behavior("backup", { target: { x: meters, y: 0, z: 0 }, speed }, (2 * meters) / speed + BEHAVIOR_MARGIN_S, `${meters.toFixed(2)} m`);
+      return;
+    }
     const seconds = meters / (this.opts.maxLinear * this.opts.forwardEfficiency);
     await this.moveChunks(-this.opts.maxLinear, 0, seconds);
   }
@@ -275,6 +339,15 @@ export class RobotTools {
     if (isError) return none;
     try {
       const names = ((JSON.parse(text) as { actions?: { name?: string }[] }).actions ?? []).map((a) => a.name ?? "");
+      const navigate = names.find((n) => n.endsWith("/navigate_to_pose"));
+      const namespace = navigate ? navigate.slice(0, -"/navigate_to_pose".length) : null;
+      const behaviors = namespace !== null && Object.keys(NAV2_BEHAVIORS).every((b) => names.includes(`${namespace}/${b}`));
+      if (behaviors && this.behaviorNamespace !== namespace) {
+        this.behaviorNamespace = namespace;
+        if (this.opts.nav2Motion) {
+          process.stderr.write(`[Motion] Nav2 behaviors of ${namespace} (spin, drive_on_heading, backup): no cmd_vel from the agent\n`);
+        }
+      }
       return {
         navigate: names.some((n) => n.endsWith("/navigate_to_pose")),
         explore: names.some((n) => n === this.exploreAction),
