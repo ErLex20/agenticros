@@ -242,12 +242,13 @@ export class RobotTools {
     try {
       const r = JSON.parse(text.slice(text.indexOf("{"))) as {
         success?: boolean;
-        result?: { status?: string; error_msg?: string; distance_traveled?: number; angular_distance_traveled?: number };
+        result?: { status?: string; error_code?: number; error_msg?: string; distance_traveled?: number; angular_distance_traveled?: number };
       };
       const done = r.result?.distance_traveled ?? r.result?.angular_distance_traveled;
       outcome = `${r.result?.status ?? (r.success ? "succeeded" : "failed")}` +
         (typeof done === "number" ? `, ${name === "spin" ? `${Math.round((done * 180) / Math.PI)} deg` : `${done.toFixed(2)} m`}` : "") +
-        (r.result?.error_msg ? ` (${r.result.error_msg})` : "");
+        // Nav2 error codes: 701 / 711 / 721 timeout, 702 / 712 / 722 TF error, 703 / 714 / 723 collision ahead.
+        (r.result?.error_code ? ` (error ${r.result.error_code}${r.result.error_msg ? `: ${r.result.error_msg}` : ""})` : "");
     } catch {
       // keep the raw outcome
     }
