@@ -175,6 +175,7 @@ async function main(): Promise<void> {
       ...DEFAULT_LIMITS,
       stopDistanceM: envPositive("NEBIUS_STOP_DISTANCE_M", DEFAULT_LIMITS.stopDistanceM),
       strongConfidence,
+      ...(process.env.NEBIUS_FULL_TURN_DEG ? { fullTurnDeg: envPositive("NEBIUS_FULL_TURN_DEG", 450, 720) } : {}),
     },
   });
 

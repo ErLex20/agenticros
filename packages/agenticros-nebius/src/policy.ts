@@ -88,6 +88,11 @@ export interface PolicyLimits {
   /** The target must be within this bearing for the goal to count as reached. */
   arriveBearingDeg: number;
   searchStepDeg: number;
+  /**
+   * Rotation of a search turn before exploring elsewhere (NEBIUS_FULL_TURN_DEG); unset: 360 deg plus
+   * one step. With a camera wider than the step, 360 - step already shows every direction.
+   */
+  fullTurnDeg?: number;
   /** Distance walked toward the most open direction before searching again. */
   exploreStepM: number;
   /** Exploration moves allowed before giving up (each one is followed by a new search turn). */
@@ -366,7 +371,7 @@ export function wrapDeg(deg: number): number {
 }
 
 export function fullTurnSearched(search: SearchState, limits: PolicyLimits): boolean {
-  return search.searchedDeg >= 360 + limits.searchStepDeg;
+  return search.searchedDeg >= (limits.fullTurnDeg ?? 360 + limits.searchStepDeg);
 }
 
 /** Doorway reports within this angle of each other are the same doorway. */
