@@ -110,7 +110,7 @@ function navigationResult(text: string, isError: boolean): NavigationResult {
 export class RobotTools {
   /** Set on Ctrl-C: no further motion command is sent. */
   aborted = false;
-  /** Namespace of the Nav2 behaviors (e.g. /dottorcane/dua_nav2), found with navigate_to_pose. */
+  /** Namespace of the Nav2 behaviors (e.g. /dottorcane/dua_nav2, "" for a Nav2 at the root), found with navigate_to_pose. */
   private behaviorNamespace: string | null = null;
 
   constructor(
@@ -225,7 +225,7 @@ export class RobotTools {
    */
   private async behavior(name: keyof typeof NAV2_BEHAVIORS, goal: Record<string, unknown>, budgetS: number, label: string): Promise<void> {
     if (this.aborted) throw new Error("motion aborted");
-    if (!this.behaviorNamespace) {
+    if (this.behaviorNamespace === null) {
       throw new Error(
         `Nav2 behaviors (spin, drive_on_heading, backup) not found: ${label} refused, the agent never publishes cmd_vel ` +
           "itself (start dua_nav2 before the agent, or NEBIUS_NAV2_MOTION=off for timed cmd_vel motions)",
@@ -346,7 +346,7 @@ export class RobotTools {
       if (behaviors && this.behaviorNamespace !== namespace) {
         this.behaviorNamespace = namespace;
         if (this.opts.nav2Motion) {
-          process.stderr.write(`[Motion] Nav2 behaviors of ${namespace} (spin, drive_on_heading, backup): no cmd_vel from the agent\n`);
+          process.stderr.write(`[Motion] Nav2 behaviors of ${namespace || "/"} (spin, drive_on_heading, backup): no cmd_vel from the agent\n`);
         }
       }
       return {
