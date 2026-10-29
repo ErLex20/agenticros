@@ -1,10 +1,10 @@
-# AgenticROS (hackathon-nvidia fork)
+# AgenticROS (hackathon-physical-ai fork)
 
-AgenticROS is a ROS 2 integration for AI agent platforms: a **core** (transport, types, config) plus **adapters** per platform. This fork is used as a submodule of `hackathon-nvidia` (`tools/agenticros`), where its main consumer is the **Nebius adapter** driving a simulated Unitree Go2 in Gazebo.
+AgenticROS is a ROS 2 integration for AI agent platforms: a **core** (transport, types, config) plus **adapters** per platform. This fork is used as a submodule of `hackathon-physical-ai` (`tools/agenticros`), where its main consumer is the **Nebius adapter** driving a simulated Unitree Go2 in Gazebo.
 
 The parent repo's `CLAUDE.md` covers the container, the simulation and the end-to-end workflow. This file covers the TypeScript monorepo.
 
-## Deployment context (hackathon-nvidia)
+## Deployment context (hackathon-physical-ai)
 
 - Everything runs inside the DUA dev container (`/home/neo/workspace`); the `ros2` CLI **is** available there and fine for debugging.
 - Transport: **local DDS** (`transport.mode = "local"`, rclnodejs, domain 0), not Zenoh. Config comes from `AGENTICROS_CONFIG_PATH` = `<workspace>/config/agenticros.json`, not `~/.agenticros/config.json`.
